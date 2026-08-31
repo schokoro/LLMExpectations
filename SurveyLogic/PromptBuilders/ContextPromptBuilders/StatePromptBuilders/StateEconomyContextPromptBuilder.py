@@ -21,9 +21,10 @@ class StateEconomyContextPromptBuilder(BasePromptBuilder):
         rateChangePrev1m = self.usdRubRateChangeProvider.getRateDifferenceByMonthOffset(curMonthFirstDay, 1)
         rateChangePrev3m = self.usdRubRateChangeProvider.getRateDifferenceByMonthOffset(curMonthFirstDay, 3)
         rateChangePrev6m = self.usdRubRateChangeProvider.getRateDifferenceByMonthOffset(curMonthFirstDay, 6)
+        rateChangePrev12m = self.usdRubRateChangeProvider.getRateDifferenceByMonthOffset(curMonthFirstDay, 12)
 
         localDescription = self._getLocalDescription(rateChange1d, rateChange1w, rateChange2w)
-        globalDescription = self._getGlobalDescription(surveyDate, rateChangePrev1m, rateChangePrev3m, rateChangePrev6m)
+        globalDescription = self._getGlobalDescription(rateChangePrev1m, rateChangePrev3m, rateChangePrev6m, rateChangePrev12m)
 
         prompt = self.prompt.replace(constants.localUsdRubTag, localDescription)
         prompt = prompt.replace(constants.globalUsdRubTag, globalDescription)
@@ -46,36 +47,38 @@ class StateEconomyContextPromptBuilder(BasePromptBuilder):
                 continue
 
             if directions[i] == 'стабилен':
-                result += f'за {periods[i]} не изменился\n'
+                result += f'-за {periods[i]} не изменился\n'
                 continue
 
-            result += f'за {periods[i]} {directions[i]} на {abs(rates[i]*100):.1f}%\n'
+            result += f'-за {periods[i]} {directions[i]} на {abs(rates[i]*100):.1f}%\n'
 
         return result
 
-    def _getGlobalDescription(self, d: date, rateChangePrev1m, rateChangePrev3m, rateChangePrev6m):
+    def _getGlobalDescription(self, rateChangePrev1m, rateChangePrev3m, rateChangePrev6m, rateChangePrev12m):
         result = ''
 
         direction1m = getUsdRubDirection(rateChangePrev1m)
         direction3m = getUsdRubDirection(rateChangePrev3m)
         direction6m = getUsdRubDirection(rateChangePrev6m)
+        direction12m = getUsdRubDirection(rateChangePrev12m)
 
-        onePeriod = getDeltaDescription(d, 1)
-        threePeriod = getDeltaDescription(d, 3)
-        sixPeriod = getDeltaDescription(d, 6)
+        onePeriod = getDeltaDescription(1)
+        threePeriod = getDeltaDescription(3)
+        sixPeriod = getDeltaDescription(6)
+        twelweperiod = getDeltaDescription(12)
 
-        periods = [onePeriod, threePeriod, sixPeriod]
-        directions = [direction1m, direction3m, direction6m]
-        rates = [rateChangePrev1m, rateChangePrev3m, rateChangePrev6m]
+        periods = [onePeriod, threePeriod, sixPeriod, twelweperiod]
+        directions = [direction1m, direction3m, direction6m, direction12m]
+        rates = [rateChangePrev1m, rateChangePrev3m, rateChangePrev6m, rateChangePrev12m]
 
         for i in range(len(periods)):
             if directions[i] is None:
                 continue
 
             if directions[i] == 'стабилен':
-                result += f'за {periods[i]} не изменился\n'
+                result += f'-за {periods[i]} не изменился\n'
                 continue
 
-            result += f'за {periods[i]} {directions[i]} на {abs(rates[i] * 100):.1f}%\n'
+            result += f'-за {periods[i]} {directions[i]} на {abs(rates[i] * 100):.1f}%\n'
 
         return result

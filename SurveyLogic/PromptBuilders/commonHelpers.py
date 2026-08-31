@@ -9,52 +9,107 @@ months = {
     }
 
 months_ru = {
-    1: 'Январь',
-    2: 'Февраль',
-    3: 'Март',
-    4: 'Апрель',
-    5: 'Май',
-    6: 'Июнь',
-    7: 'Июль',
-    8: 'Август',
-    9: 'Сентябрь',
-    10: 'Октябрь',
-    11: 'Ноябрь',
-    12: 'Декабрь'
+    1: 'январь',
+    2: 'февраль',
+    3: 'март',
+    4: 'апрель',
+    5: 'май',
+    6: 'июнь',
+    7: 'июль',
+    8: 'август',
+    9: 'сентябрь',
+    10: 'октябрь',
+    11: 'ноябрь',
+    0: 'декабрь'
 }
 
-def getDirection(inflation: float):
+
+def processIfNone(data):
+    if data is None or data == 'None' or data == '':
+        return 'нет информации'
+
+    return str(data)
+
+def processYesNo(data):
+    if data == '1':
+        return True
+
+    return False
+
+def processBoolToYesNo(data: bool):
+    if data:
+        return 'Да'
+
+    return 'Нет'
+
+def checkNoAnswer(value):
+    noAnswerSet = {99999997, 99999998, 99999999}
+    if value in noAnswerSet or value is None or value == '':
+        return True
+
+    return False
+
+def getNoAnswerDescription(value):
+    if value == 99999997:
+        return 'затрудняюсь ответить'
+    elif value == 99999998:
+        return 'отказ от ответа'
+    elif value == 99999999:
+        return 'нет ответа'
+    elif value is None or value == '':
+        return 'нет информации'
+
+    raise ValueError(f'Incorrect value: {value}')
+
+def getSafeDescription(value):
+    if checkNoAnswer(value):
+        return getNoAnswerDescription(value)
+
+    return value
+
+def getDirection(inflation: float, isInflation: bool):
+
     if inflation > 0.0:
-        return "подорожал"
+        return "подорожал" if not isInflation else 'повысилась'
 
     if inflation < 0.0:
-        return "подешевел"
+        return "подешевел" if not isInflation else 'понизилась'
 
-    return "цена не изменилась"
+    return "цена не изменилась" if not isInflation else 'не изменилась'
 
-def getDescriptionMonth(inflation: float, month: int):
+def getDescriptionMonth(inflation: float, month: int, isInflation: bool = False):
+
+    description = getDeltaDescription(month)
     if inflation is None:
-        return ''
+        return f'за {description} нет информации'
 
-    direction = getDirection(inflation)
+    direction = getDirection(inflation, isInflation)
     if abs(inflation) < 0.00001:
-        return f"в предыдущие {month} месяцев не изменилась"
+        return f"за {description} не изменилась"
 
     clearInflation = (inflation + 1)**(month/12) - 1
-    return f'{direction} на {showInflation(abs(clearInflation))}% в предыдущие {month} месяцев'
+    return f'за {description} {direction} на {showInflation(abs(clearInflation))}%'
 
-def getDescriptionWeeks(inflation: float, weeks: int):
+def getDescriptionWeeks(inflation: float, weeks: int, isInflation: bool = False):
+    description = getDescriptionNumberWeeks(weeks)
     if inflation is None:
-        return ''
+        return f'за {description} нет информации'
 
-    direction = getDirection(inflation)
+    direction = getDirection(inflation, isInflation)
     if abs(inflation) < 0.00001:
-        return f"за последние {weeks} недель не изменилась"
+        return f"{description} не изменилась"
 
     clearInflation = (inflation + 1) ** (weeks*7 / 365) - 1
-    return f'{direction} на {showInflation(abs(clearInflation))}% за последние {weeks} недель'
+    return f'{description} {direction} на {showInflation(abs(clearInflation))}%'
 
+def getDescriptionNumberWeeks(weeks: int):
+    if weeks == 1:
+        return 'за последнюю 1 неделю'
 
+    if weeks in {2, 3, 4}:
+        return f'за последние {weeks} недели'
+
+    return f'за последние {weeks} недель'
 
 def getTop5(map, goods: dict[str, float]):
     rosstatGoods = dict[str, float]()
@@ -75,9 +130,10 @@ def getTop5(map, goods: dict[str, float]):
     top_5 = sorted(rosstatGoods.items(), key=lambda x: x[1], reverse=True)[:min(5, len(rosstatGoods))]
     return [item[0] for item in top_5]
 
+
 def parseRosstateMonth(value: str, year: int) -> date:
     # Извлекаем день и месяц
-    parts = value.replace('на ', '').strip().split()
+    parts = value.replace('на ', '').replace('*', '').strip().split()
     day = int(parts[0])
     month_name = parts[1].lower()
     month = months[month_name]
@@ -88,16 +144,16 @@ def showInflation(inflation: float)->str:
     if inflation is None:
         return 'нет данных'
 
-    return f'{inflation*100: .1f}'
+    return f'{inflation*100:.1f}'
 
-def getDeltaDescription(d: date, offsetMonth: int):
-    finishMonth = (d.month + 12 - 1) % 12
+def getDeltaDescription(offsetMonth: int):
     if offsetMonth == 1:
-        return months_ru[finishMonth]
+        return '1 полный календарный месяц'
 
-    startMonth = (d.month + 12 - offsetMonth) % 12
+    if offsetMonth in {2, 3, 4}:
+        return f'{offsetMonth} полных календарных месяца'
 
-    return f'{months_ru[startMonth]} - {months_ru[finishMonth]}'
+    return f'{offsetMonth} полных календарных месяцев'
 
 def getUsdRubDirection(rate):
     if rate == None:

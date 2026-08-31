@@ -21,7 +21,7 @@ start_year = 2024
 wavesToYearMap = {wave: start_year - (start_wave - wave) for wave in range(start_wave, end_wave - 1, -1)}
 converter = SimpleRLMSProfileConverter()
 extractor = RLMSProfileExtractor(converter, configuration.regularGoods, configuration.durableGoods, configuration.services)
-sampleSize = 100
+sampleSize = 1000
 
 folder = Path(targetDirectory)
 if folder.exists():

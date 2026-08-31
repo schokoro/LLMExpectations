@@ -13,7 +13,7 @@ def safe_norm(var: str, row):
 
 def norm(x):
     """Преобразует pandas-значение в стандартный Python-тип, заменяя NaN на None."""
-    if pd.isna(x):
+    if pd.isna(x) or x is None or x == '':
         return None
     if isinstance(x, (np.integer, np.floating)):
         return x.item()
@@ -23,12 +23,12 @@ def safe_value_to_label(var: str, row, meta):
     if var in row:
         return value_to_label(var, row[var], meta)
 
-    return 'Нет ответа'
+    return None
 
 def value_to_label(var: str, value, meta):
     """Возвращает текстовую метку для закодированного значения переменной."""
     value = norm(value)
-    if value is None:
+    if value is None or value == '':
         return None
     labels = meta.variable_value_labels.get(var, {})
     if not labels:
@@ -38,5 +38,3 @@ def value_to_label(var: str, value, meta):
     if isinstance(value, float) and value.is_integer() and int(value) in labels:
         return labels[int(value)]
     return value
-
-

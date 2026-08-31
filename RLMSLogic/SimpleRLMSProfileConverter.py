@@ -30,6 +30,7 @@ class SimpleRLMSProfileConverter:
 
             idIndividualrespondent=profile.idIndividualrespondent,
             idHHrespondent=profile.idHHrespondent,
+            hhHasChildren=profile.hhHasChildren,
             totalFamilyMembers=profile.totalFamilyMembers,
             allFamilyMonthIncome=profile.allFamilyMonthIncome,
 
@@ -48,6 +49,8 @@ class SimpleRLMSProfileConverter:
             hasOtherMortgage=profile.hasOtherMortgage,
             hasLand=profile.hasLand,
             landOwner=profile.landOwner,
+            vacationForeign=profile.vacationForeign,
+            vacationDomestic=profile.vacationDomestic,
 
             regular=profile.regular,
             durable=profile.durable,

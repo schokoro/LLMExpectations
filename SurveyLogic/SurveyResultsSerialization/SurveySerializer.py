@@ -11,7 +11,7 @@ class SurveySerializer(BaseSurveySerializer):
     def __init__(self, resultFolder: Path):
         self.resultFolder = resultFolder
 
-    def saveSurvey(self, surveys: list[InflationSurveyRespond], surveyDate: date):
+    def saveSurvey(self, surveys, surveyDate: date):
         dir_path = self.resultFolder
         dir_path.mkdir(parents=True, exist_ok=True)
 
@@ -22,7 +22,7 @@ class SurveySerializer(BaseSurveySerializer):
         return
 
     @staticmethod
-    def __saveSingleSurvey(survey: InflationSurveyRespond, targetFolder: Path):
+    def __saveSingleSurvey(survey, targetFolder: Path):
         filename = f'{survey.target_date}_{survey.respondent_id}.json'
         file_path = targetFolder / filename
 

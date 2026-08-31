@@ -30,6 +30,7 @@ class RLMSProfileData:
 
     idIndividualrespondent: float
     idHHrespondent: float
+    hhHasChildren: int
     totalFamilyMembers: float
     allFamilyMonthIncome: float
 
@@ -48,6 +49,9 @@ class RLMSProfileData:
     hasOtherMortgage: str
     hasLand: str
     landOwner: str
+
+    vacationForeign: int
+    vacationDomestic: int
 
     regular: dict[str, float]
     durable: dict[str, float]

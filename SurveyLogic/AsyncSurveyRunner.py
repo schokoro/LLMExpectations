@@ -54,10 +54,8 @@ class AsyncSurveyRunner(BaseSurveyRunner):
                 self.logger.logDebug(f'Survey #{index} failed: {e}')
             else:
                 results.append((index, result))
-
-            self.logger.logDebug(f'Surveyed profile # {index}.')
-            results.append((index, result))
-            completed += 1
+                self.logger.logDebug(f'Surveyed profile # {index}.')
+                completed += 1
 
             if completed % 10 == 0 or completed == total:
                 self.logger.logDebug(f'Progress: {completed}/{total} (failed: {failed_count})')
@@ -65,6 +63,8 @@ class AsyncSurveyRunner(BaseSurveyRunner):
         # Сортируем по индексу для сохранения порядка
         results.sort(key=lambda x: x[0])
         for r in results:
+            print(r[0])
+            print(r[1])
             r[1].hasCredit = profiles[r[0]].hasCredit
             r[1].hasSavings = profiles[r[0]].hasSavings
 

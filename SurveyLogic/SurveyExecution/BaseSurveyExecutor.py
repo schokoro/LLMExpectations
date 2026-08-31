@@ -6,5 +6,5 @@ from SurveyLogic.SurveyResults.InflationSurveyRespond import InflationSurveyResp
 
 class BaseSurveyExecutor(ABC):
     @abstractmethod
-    def executeSurvey(self, surveyDate: date, profile: ProfileData) -> InflationSurveyRespond:
+    def executeSurvey(self, surveyDate: date, profile: ProfileData):
         pass

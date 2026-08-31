@@ -1,11 +1,12 @@
 import asyncio
+from datetime import datetime
 from pathlib import Path
 
 from Configuration import configuration
 from Configuration.configuration import mlcluster_key
 from Logging.SimpleLogger import SimpleLogger
 from SurveyExecutionTools.surveyExecutionHelpers import saveExperimentConfiguration
-from SurveyLogic.PromptBuilders.profileBuildersHelpers import createCustomPromptBuilder
+from SurveyLogic.PromptBuilders.PromptBuilderFactory import PromptBuilderFactory
 from SurveyLogic.SurveyResultsSerialization.SurveySerializer import SurveySerializer
 from SurveyLogic.Surveyers.AsyncSurveyer import AsyncSurveyer
 from SurveyLogic.Surveyers.StubSurveyer import StubSurveyer
@@ -13,32 +14,41 @@ from SurveyLogic.surveyHelpers import createAsyncSurveyRunner, extractDatesFromF
     getDatesRowWithMonthlyStep, getDatesRowWithWeeklyStep
 from experimentsConfiguration import ExperimentsConfiguration
 
-experimentUniqueName='mlcluster_qwen36_async_hh_weekly_2022_02_04'
+offsetDays = -6
+experimentUniqueName=f'mlcluster_qwen38_async_all_{offsetDays}d'
 profilesFolder = Path('./data/Target profiles')
+profilesCount = 100
 resultsFolder = Path('data/SurveyResults/')/experimentUniqueName
 copyPromptTemplatesToFolder(Path('SurveyLogic/PromptBuilders/Prompts/'), resultsFolder/'Prompts')
 
-#surveyDates = extractDatesFromFile(configuration.inflationSurveysDates)
+surveyDates = extractDatesFromFile(configuration.inflationSurveysDates, offsetDays=offsetDays)
+
 #surveyDates = getDatesRowWithMonthlyStep('2020.12.01', '2021.01.01')
-surveyDates = getDatesRowWithWeeklyStep('2022.02.05', '2022.04.02')
+#surveyDates = getDatesRowWithWeeklyStep('2022.03.12', '2022.05.07')
 
 cfg = ExperimentsConfiguration(
-    useEconomy=True,
+    useIndividualRLMSData=True,
     useFamilyInformation=True,
-    useStateExpenses=True)
+    useFamilyExpenses=True,
+    useStateExpenses=True,
+    useEconomy=True,
+    useInflation=True,
+    usePreviousInflationExpectations=True
+    )
 
 saveExperimentConfiguration(cfg, resultsFolder)
 
-systemPromptBuilder, promptBuilder = createCustomPromptBuilder(cfg)
+factory = PromptBuilderFactory()
+systemPromptBuilder, promptBuilder = factory.createCustomPromptBuilder(cfg)
 logger = SimpleLogger()
 
-surveyer = AsyncSurveyer(modelToUse='Qwen/Qwen3.6-27B', key=mlcluster_key, logger=logger, baseUrl=configuration.mlclusterUrl)
-#surveyer = StubSurveyer()
+#surveyer = AsyncSurveyer(modelToUse='Qwen/Qwen3.8-27B', key=mlcluster_key, logger=logger, baseUrl=configuration.mlclusterUrl)
+surveyer = StubSurveyer()
 
 surveySerializer = SurveySerializer(resultsFolder)
 
 for surveyDate in surveyDates:
-    runner = createAsyncSurveyRunner(profilesFolder, systemPromptBuilder, promptBuilder, surveySerializer, surveyer,
+    runner = createAsyncSurveyRunner(profilesFolder, systemPromptBuilder, promptBuilder, surveySerializer, surveyer, profilesCount,
                                      logger)
     surveyResults = asyncio.run(runner.RunSurvey(surveyDate))
     surveySerializer.saveSurvey(surveyResults, surveyDate)

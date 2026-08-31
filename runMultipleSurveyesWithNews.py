@@ -1,30 +1,34 @@
+import asyncio
 from pathlib import Path
 
-import pandas as pd
-
 from Configuration import configuration
+from Configuration.configuration import mlcluster_key
 from Logging.SimpleLogger import SimpleLogger
 from SurveyLogic.PromptBuilders.profileBuildersHelpers import createNewsPromptBuilder
 from SurveyLogic.SurveyResultsSerialization.SurveySerializer import SurveySerializer
-from SurveyLogic.Surveyers.StandardSurveyer import StandardSurveyer
+from SurveyLogic.Surveyers.AsyncSurveyer import AsyncSurveyer
 from SurveyLogic.Surveyers.StubSurveyer import StubSurveyer
-from SurveyLogic.surveyHelpers import createSurveyRunner
+from SurveyLogic.surveyHelpers import createAsyncSurveyRunner, copyPromptTemplatesToFolder, \
+    getDatesRowWithWeeklyStep
 
-logger = SimpleLogger()
+experimentUniqueName='mlcluster_qwen36_async_news'
 profilesFolder = Path('./data/Target profiles')
-resultsFolder = Path('data/SurveyResults/mlcluster_qwen36_no_inflation_no_politics_no_date_2016_2026_QS')
+profilesCount = 100
+resultsFolder = Path('data/SurveyResults/')/experimentUniqueName
+copyPromptTemplatesToFolder(Path('SurveyLogic/PromptBuilders/Prompts/'), resultsFolder/'Prompts')
 
-surveyDates = pd.date_range(start='2016-04-01', end='2026-04-01', freq='QS', inclusive='both').tolist()
+surveyDates = getDatesRowWithWeeklyStep('2022.01.12', '2022.09.07')
 
-#promptbuilder logic
 systemPromptBuilder, promptBuilder = createNewsPromptBuilder()
+logger = SimpleLogger()
 
-#surveyer = StandardSurveyer(modelToUse='Qwen/Qwen3.6-27B', key=configuration.mlcluster_key, logger=logger, baseUrl=configuration.mlclusterUrl)
-surveyer = StubSurveyer()
+surveyer = AsyncSurveyer(modelToUse='Qwen/Qwen3.6-27B', key=mlcluster_key, logger=logger, baseUrl=configuration.mlclusterUrl)
+#surveyer = StubSurveyer()
 
 surveySerializer = SurveySerializer(resultsFolder)
-runner = createSurveyRunner(profilesFolder, systemPromptBuilder, promptBuilder, surveySerializer, surveyer, logger)
 
 for surveyDate in surveyDates:
-    surveyResults = runner.RunSurvey(surveyDate)
+    runner = createAsyncSurveyRunner(profilesFolder, systemPromptBuilder, promptBuilder, surveySerializer, surveyer, profilesCount,
+                                     logger)
+    surveyResults = asyncio.run(runner.RunSurvey(surveyDate))
     surveySerializer.saveSurvey(surveyResults, surveyDate)

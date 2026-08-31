@@ -6,8 +6,6 @@ from SurveyLogic.PromptBuilders.BasePromptBuilder import BasePromptBuilder
 from SurveyLogic.PromptBuilders.Profiles.ProfileData import ProfileData
 from SurveyLogic.PromptBuilders.StatisticsProviders.InflationProviderLogic.BaseInflationProvider import \
     BaseInflationProvider
-from SurveyLogic.PromptBuilders.StatisticsProviders.InflationProviderLogic.BaseWeeklyInflationProvider import \
-    BaseWeeklyInflationProvider
 from SurveyLogic.PromptBuilders.commonHelpers import loadRlmsGoodsToRosstatGoodsMap, getTop5, getDescriptionWeeks
 
 
@@ -22,6 +20,7 @@ class StateExpensesProfilePromptBuilder(BasePromptBuilder):
         goods = [profile.regular, profile.durable, profile.services]
         goodNames = [constants.regularTag, constants.durableTag, constants.servicesTag]
 
+        allGoodsAreOff = True
         result = self.prompt
         for i in range(len(goods)):
             top5Goods = getTop5(self.map, goods[i])
@@ -30,8 +29,14 @@ class StateExpensesProfilePromptBuilder(BasePromptBuilder):
             inflation2w = self.inflationProvider.getProductsCommonWeeklyInflationLastNWeeks(surveyDate, top5Goods, 2)
             inflation4w = self.inflationProvider.getProductsCommonWeeklyInflationLastNWeeks(surveyDate, top5Goods, 4)
 
+            if any(x is not None for x in inflation1w) or any(x is not None for x in inflation2w) or any(x is not None for x in inflation4w):
+                allGoodsAreOff = False
+
             currentPrompt = self._getCurrentGoodsPromptSet(top5Goods, inflation1w, inflation2w, inflation4w)
             result = result.replace(goodNames[i], currentPrompt)
+
+        if allGoodsAreOff:
+            return 'Нет информации по недельныим данным'
 
         return result
 

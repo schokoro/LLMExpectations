@@ -42,8 +42,9 @@ class ExpensesProfilePromptBuilder(BasePromptBuilder):
             inflation1mDescription = getDescriptionMonth(inflation1m[i], 1)
             inflation3mDescription = getDescriptionMonth(inflation3m[i], 3)
             inflation6mDescription = getDescriptionMonth(inflation6m[i], 6)
+            inflation12mDescription = getDescriptionMonth(inflation6m[i], 12)
 
-            result += f'#{i}. {top5Goods[i]}: {inflation1mDescription}, {inflation3mDescription}, {inflation6mDescription}\n'
+            result += f'#{i}. {top5Goods[i]}: {inflation1mDescription}, {inflation3mDescription}, {inflation6mDescription}, {inflation12mDescription}\n'
 
         return result
 

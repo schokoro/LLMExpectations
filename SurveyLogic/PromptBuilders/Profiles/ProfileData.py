@@ -25,6 +25,7 @@ class ProfileData:
 
     idIndividualrespondent: float
     idHHrespondent: float
+    hhHasChildren: int
     totalFamilyMembers: float
     allFamilyMonthIncome: float
 
@@ -39,6 +40,9 @@ class ProfileData:
     hasOtherMortgage: str
     hasLand: str
     landOwner: str
+
+    vacationForeign: int
+    vacationDomestic: int
 
     hasRussianCar: str
     yearsOfRussianCar: float
