@@ -8,16 +8,19 @@ from SurveyLogic.PromptBuilders.profileBuildersHelpers import createNewsPromptBu
 from SurveyLogic.SurveyResultsSerialization.SurveySerializer import SurveySerializer
 from SurveyLogic.Surveyers.AsyncSurveyer import AsyncSurveyer
 from SurveyLogic.Surveyers.StubSurveyer import StubSurveyer
-from SurveyLogic.surveyHelpers import createAsyncSurveyRunner, copyPromptTemplatesToFolder, \
+from SurveyLogic.surveyHelpers import createAsyncSurveyRunner, extractDatesFromFile, copyPromptTemplatesToFolder, \
     getDatesRowWithWeeklyStep
 
+offsetDays = -14
 experimentUniqueName='mlcluster_qwen36_async_news'
 profilesFolder = Path('./data/Target profiles')
 profilesCount = 100
 resultsFolder = Path('data/SurveyResults/')/experimentUniqueName
 copyPromptTemplatesToFolder(Path('SurveyLogic/PromptBuilders/Prompts/'), resultsFolder/'Prompts')
 
-surveyDates = getDatesRowWithWeeklyStep('2022.01.12', '2022.09.07')
+surveyDates = extractDatesFromFile(configuration.inflationSurveysDates, offsetDays=offsetDays)
+#surveyDates = getDatesRowWithWeeklyStep('2022.01.12', '2022.09.07')
+#surveyDates = pd.date_range(start='2016-04-01', end='2026-04-01', freq='QS', inclusive='both').tolist()
 
 systemPromptBuilder, promptBuilder = createNewsPromptBuilder()
 logger = SimpleLogger()

@@ -7,6 +7,10 @@ from SurveyLogic.PromptBuilders.StatisticsProviders.InflationProviderLogic.EMISS
 from SurveyLogic.PromptBuilders.StatisticsProviders.InflationProviderLogic.InflationProvider import InflationProvider
 from SurveyLogic.PromptBuilders.StatisticsProviders.InflationProviderLogic.MultipleEMISSFilesInflationProvider import \
     MultipleEMISSFilesInflationProvider
+from SurveyLogic.PromptBuilders.StatisticsProviders.InflationProviderLogic.MultipleWeeklyInflationProvider import \
+    MultipleWeeklyInflationProvider
+from SurveyLogic.PromptBuilders.StatisticsProviders.InflationProviderLogic.RosstatWeeklyInflationProvider import \
+    RosstatWeeklyInflationProvider
 
 
 class TestInflationProvider(TestCase):
@@ -18,12 +22,17 @@ class TestInflationProvider(TestCase):
         path2 = Path('../data/Monthly Inflation for goods and services in regions_2015_2020_v0.xlsx')
         path3 = Path('../data/Monthly Inflation for goods and services in regions_2021_2026_v0.xlsx')
 
+        weeklyPath = Path('../data/Nedel_ipc.xlsx')
+
         files = [path1, path2, path3]
         yearsSets = [set(range(2009, 2015)), set(range(2015, 2021)), set(range(2021, 2027))]
         providers = [EMISSWebSingleMonthInflationProvider(x) for x in files]
 
         singleMonthInflationProvider = MultipleEMISSFilesInflationProvider(providers, yearsSets)
-        cls.inflationProvider = InflationProvider(singleMonthInflationProvider)
+        weeklyInflationProvider = RosstatWeeklyInflationProvider(
+            MultipleWeeklyInflationProvider(weeklyPath, list(range(2022, 2027))))
+
+        cls.inflationProvider = InflationProvider(singleMonthInflationProvider, weeklyInflationProvider)
 
     def test_get_average_common_year_inflation_last_nmonth(self):
         format = '%d.%m.%Y'

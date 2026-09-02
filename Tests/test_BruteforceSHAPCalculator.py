@@ -5,7 +5,7 @@ from SHAPAnalysis.BruteforceSHAPCalculator import BruteforceSHAPCalculator
 
 class TestBruteforceSHAPCalculator(TestCase):
     def test_calculate_shap_values(self):
-        bf = BruteforceSHAPCalculator(2, ['1', '2'])
+        bf = BruteforceSHAPCalculator(['1', '2'])
 
         responds = [1, 2, 3, 4]
         expected = {'1': 1.0, '2': 0.5}
