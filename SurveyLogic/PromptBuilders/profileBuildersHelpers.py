@@ -1,4 +1,5 @@
 from Configuration import configuration
+from NewsLogic.NewsContextProvider import NewsContextProvider
 from SHAPAnalysis.AllMinusOneShapCalculator import AllMinusOneShapCalculator
 from SHAPAnalysis.BruteforceSHAPCalculator import BruteforceSHAPCalculator
 from SHAPAnalysis.ZeroPlusOneShapCalculator import ZeroPlusOneShapCalculator
@@ -29,7 +30,7 @@ def createSimplePromptBuilder() -> (BasePromptBuilder, BasePromptBuilder):
 
     return SystemPromptBuilder(prompts.systemPrompt), CompositePromptBuilder(builders, headers)
 
-def createNewsPromptBuilder() -> (BasePromptBuilder, BasePromptBuilder):
+def createNewsPromptBuilder(newsContextProvider: NewsContextProvider) -> (BasePromptBuilder, BasePromptBuilder):
     builders = []
 
     mrotProvider = MROTProvider(configuration.mrotStatisticsPath)
@@ -38,7 +39,7 @@ def createNewsPromptBuilder() -> (BasePromptBuilder, BasePromptBuilder):
                                                                configuration.rlmsToInflationRegionsPath)
 
     builders.append(CommonProfilePromptBuilder(prompts.respondentPrompt, mrotProvider, averageBuyingsProvider))
-    builders.append(NewsPromptBuilder())
+    builders.append(NewsPromptBuilder(newsContextProvider))
     builders.append(TaskPromptBuilder(prompts.taskPrompt))
 
     headers = ['Основные параметры опроса и респондента', 'Новости', 'Задача']
