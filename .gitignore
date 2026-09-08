@@ -244,3 +244,12 @@ artefacts/
 .codex/
 AGENTS.md
 CLAUDE.md
+/Configuration/openrouter_key.txt
+data/Target profiles/
+data/RLMS waves/
+Configuration/*_key.txt
+data/newsDB/*.db
+data/SurveyResults/
+notebooks/
+tmp/
+.idea/
