@@ -1,0 +1,127 @@
+# Манифест каталога newsDB.
+#
+# Описывает ЭТУ копию проектной базы и её связь с общим корпусом.
+# Схема — SCHEMA.md рядом. Схема корпуса — ~/workspace/amnesiacDB/SCHEMA.md.
+
+name: newsDB
+description: >
+  Проектная база результатов суммаризации новостей плюс симлинк на общий
+  корпус amnesiacDB. Копия проектной базы blind_prophet, взятая как стартовая
+  точка для LLMExpectations.
+
+# --- Что лежит в каталоге -------------------------------------------------
+
+files:
+  project.db:
+    role: проектная база, чтение и запись
+    schema: SCHEMA.md
+    size_mb: 1.2
+    requires_extension: none        # векторов здесь нет
+  corpus.db:
+    role: симлинк на общий корпус, только чтение
+    target: ~/workspace/amnesiacDB/corpus.db
+    schema: ~/workspace/amnesiacDB/SCHEMA.md
+    manifest: ~/workspace/amnesiacDB/MANIFEST.yaml
+    requires_extension: sqlite-vec  # без модуля vec0 база не читается вообще
+    access: "file:corpus.db?mode=ro"
+
+# --- Происхождение копии --------------------------------------------------
+
+provenance:
+  copied_from: ~/workspace/blind_prophet/data/db/blind_prophet.db
+  copied_at: 2026-09-02
+  identical_to_source: true         # sha256 совпадает с оригиналом на дату копирования
+  sha256: 3f8d1b1077a97cf5da2b736e3637a45852660ce873bbecdc15dd7fe6b922024b
+  note: >
+    Копия сделана как есть, включая таблицы, специфичные для blind_prophet.
+    С момента копирования базы живут независимо и расходятся.
+
+# --- Содержимое (снимок на дату копирования) ------------------------------
+
+tables:
+  # Переносимое ядро — описано в SCHEMA.md
+  summaries:
+    rows: 13
+    portable_core: true
+    run_date_range: ["2020-04-20", "2023-05-01"]
+    horizon_days: 14                # единственное значение во всех строках
+    doc_count_range: [321, 429]
+    model: deepseek/deepseek-v4-flash
+  neutered_summaries:
+    rows: 13
+    portable_core: true
+    coverage: полное                # для каждой summaries есть строка
+    status_breakdown:
+      neutered: 6
+      residual_hard_fail: 6
+      signal_collapse: 1
+    judge_blind_rows: 1             # исключать из агрегатов, см. SCHEMA.md
+    models:
+      model_n:                      # прогоны неоднородны по модели нейтрализации
+        deepseek/deepseek-v4-flash: 11
+        openai/gpt-5.4: 2
+      model_j1: qwen/qwen3.5-397b-a17b
+      model_j2: anthropic/claude-haiku-4.5
+
+  # Специфично для blind_prophet, в переносимое ядро не входит.
+  # Не нужны — DROP TABLE, схема ядра от этого не пострадает.
+  forecasts:
+    rows: 300
+    portable_core: false
+    note: persona-ensemble прогнозы, завязаны на набор персон и модель
+  infom_expectations:
+    rows: 157
+    portable_core: false
+    note: целевой ряд опросов инФОМ, апрель 2010 — апрель 2026
+
+migrations:
+  ledger_table: migrations
+  applied:
+    - 007_create_summaries
+    - 008_create_infom
+    - 009_create_neutered_summaries
+    - 010_create_forecasts
+    - 011_summaries_horizon_days
+  note: >
+    Нумерация историческая, с пропусками: 007-010 остались от времён, когда
+    корпус и проектная база были одним файлом. В новом проекте нумеруйте с 001
+    по DDL из SCHEMA.md — он уже учитывает все изменения.
+
+# --- Контракт с корпусом --------------------------------------------------
+
+corpus_contract:
+  # Дублирует ключевые поля corpus_meta. Источник истины — сама таблица
+  # corpus_meta в corpus.db; сверяйте перед использованием векторов.
+  schema_version: 1
+  embedding_model: ai-forever/FRIDA
+  embedding_dim: 1536
+  embedding_dtype: "<f4"
+  embedding_input: lead             # вектор считается по началу сообщения
+  cached_axes:
+    - дкп
+    - инфляция
+    - продовольствие
+    - курс
+    - тарифы
+    - зарплаты
+    - труд
+    - кризис
+    - бюджет
+  axis_lookup_key: [axis, query_hash, embedding_model, dimension]
+
+# --- Ловушки --------------------------------------------------------------
+
+gotchas:
+  - >
+    День run_date в окно сбора НЕ входит: границы сравниваются как строки
+    с полными ISO-таймстампами. Фактическое окно —
+    [run_date - horizon_days, run_date).
+  - >
+    Вектор оси выбирать только по полному ключу. Кеш query_vectors общий на
+    все проекты, одноимённые оси с разными запросами лежат рядом.
+  - >
+    Строки с judge_blind = 1 исключать из агрегированных оценок эффекта
+    нейтрализации: у них не сработал измеритель, а не нейтрализация.
+  - >
+    Прогоны нейтрализации неоднородны по model_n (11 строк одной моделью,
+    2 другой). Сравнивая метрики между датами, учитывайте это.
