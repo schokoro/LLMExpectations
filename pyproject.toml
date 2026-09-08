@@ -1,0 +1,39 @@
+[project]
+name = "llmexpectations"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "amnesiac[select]",
+    "matplotlib>=3.9",
+    "numpy>=1.26",
+    "openai>=1.0",
+    "openpyxl>=3.1",
+    "pandas>=2.2",
+    "pandas-stubs~=3.0.5",
+    "pyreadstat>=1.2",
+    "requests>=2.31",
+    "scipy>=1.13",
+    "seaborn>=0.13",
+    "sqlite-vec>=0.1.9",
+    "statsmodels>=0.14",
+    "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.16",
+    "marimo>=0.24",
+]
+
+[tool.uv.sources]
+# Единственное место, где закреплена версия amnesiac. Дублировать её ещё и в
+# `dependencies` через `@ git+...` нельзя: `tool.uv.sources` перекрывает URL из
+# требования, и при расхождении ставится версия отсюда — молча.
+amnesiac = { git = "https://github.com/schokoro/amnesiac", tag = "v0.2.0" }
+
+[tool.pytest.ini_options]
+# Секция намеренно пустая: она нужна, чтобы pytest признал этот файл своим конфигом
+# и взял корень проекта за rootdir. Тесты читают данные относительными путями
+# ../data/*, поэтому запускаются из каталога Tests:
+#   cd Tests && ../.venv/bin/python -m pytest -q
