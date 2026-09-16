@@ -6,8 +6,8 @@
 name: newsDB
 description: >
   Проектная база результатов суммаризации новостей плюс симлинк на общий
-  корпус amnesiacDB. Копия проектной базы blind_prophet, взятая как стартовая
-  точка для LLMExpectations.
+  корпус amnesiacDB. Выросла из копии проектной базы blind_prophet, взятой как
+  стартовая точка для LLMExpectations.
 
 # --- Что лежит в каталоге -------------------------------------------------
 
@@ -15,8 +15,8 @@ files:
   project.db:
     role: проектная база, чтение и запись
     schema: SCHEMA.md
-    size_mb: 1.2
     requires_extension: none        # векторов здесь нет
+    journal_mode: wal               # -wal/-shm создаёт любой читатель, в git не идут
   corpus.db:
     role: симлинк на общий корпус, только чтение
     target: ~/workspace/amnesiacDB/corpus.db
@@ -24,68 +24,75 @@ files:
     manifest: ~/workspace/amnesiacDB/MANIFEST.yaml
     requires_extension: sqlite-vec  # без модуля vec0 база не читается вообще
     access: "file:corpus.db?mode=ro"
+  migrations/:
+    role: DDL этого проекта, с номера 012
+    applied_by: руками, инструмента миграций в проекте нет
 
 # --- Происхождение копии --------------------------------------------------
 
 provenance:
   copied_from: ~/workspace/blind_prophet/data/db/blind_prophet.db
   copied_at: 2026-09-02
-  identical_to_source: true         # sha256 совпадает с оригиналом на дату копирования
-  sha256: 3f8d1b1077a97cf5da2b736e3637a45852660ce873bbecdc15dd7fe6b922024b
-  note: >
-    Копия сделана как есть, включая таблицы, специфичные для blind_prophet.
-    С момента копирования базы живут независимо и расходятся.
+  identical_to_source: false        # расходится с 2026-09-06, см. divergence
+  sha256_at_copy: 3f8d1b1077a97cf5da2b736e3637a45852660ce873bbecdc15dd7fe6b922024b
+  divergence:
+    - 2026-09-06: миграция 012 — колонка summaries.failed_axes
+    - 2026-09-06: миграция 013 — таблица axis_summaries
+    - 2026-09-16: миграция 014 — удалены neutered_summaries и forecasts
+    - 2026-09-16: >
+        D-026 — кеш очищен целиком: строки, посчитанные по прежнему UTC-окну,
+        несопоставимы с московским окном, а ключ кеша их не различает
+  backups:
+    - project.db.bak-full-20260916   # полное состояние до дропа и очистки
 
-# --- Содержимое (снимок на дату копирования) ------------------------------
+# --- Содержимое (снимок на 2026-09-16) ------------------------------------
 
 tables:
-  # Переносимое ядро — описано в SCHEMA.md
   summaries:
-    rows: 13
-    portable_core: true
-    run_date_range: ["2020-04-20", "2023-05-01"]
-    horizon_days: 14                # единственное значение во всех строках
-    doc_count_range: [321, 429]
-    model: deepseek/deepseek-v4-flash
-  neutered_summaries:
-    rows: 13
-    portable_core: true
-    coverage: полное                # для каждой summaries есть строка
-    status_breakdown:
-      neutered: 6
-      residual_hard_fail: 6
-      signal_collapse: 1
-    judge_blind_rows: 1             # исключать из агрегатов, см. SCHEMA.md
-    models:
-      model_n:                      # прогоны неоднородны по модели нейтрализации
-        deepseek/deepseek-v4-flash: 11
-        openai/gpt-5.4: 2
-      model_j1: qwen/qwen3.5-397b-a17b
-      model_j2: anthropic/claude-haiku-4.5
-
-  # Специфично для blind_prophet, в переносимое ядро не входит.
-  # Не нужны — DROP TABLE, схема ядра от этого не пострадает.
-  forecasts:
-    rows: 300
-    portable_core: false
-    note: persona-ensemble прогнозы, завязаны на набор персон и модель
+    rows: 0
+    written_by: пайплайн этого проекта
+    note: очищено по D-026, серия считается с нуля
+  axis_summaries:
+    rows: 0
+    written_by: пайплайн этого проекта
+    note: >
+      осевые саммари первого этапа; пишутся ДО мета-вызова, отказавшие оси не
+      записываются
   infom_expectations:
     rows: 157
-    portable_core: false
-    note: целевой ряд опросов инФОМ, апрель 2010 — апрель 2026
+    written_by: никто, унаследована
+    note: >
+      целевой ряд опросов инФОМ, апрель 2010 — апрель 2026. Пайплайном не
+      используется, нужна контуру оценки (E02). Восстановить неоткуда — не удалять
+  migrations:
+    rows: 8
+    written_by: руками при применении миграции
+    applied:
+      - 007_create_summaries
+      - 008_create_infom
+      - 009_create_neutered_summaries
+      - 010_create_forecasts
+      - 011_summaries_horizon_days
+      - 012_summaries_failed_axes
+      - 013_axis_summaries
+      - 014_drop_blind_prophet_tables
+    note: >
+      Нумерация 007-011 историческая, от времён, когда корпус и проектная база
+      были одним файлом. Записи 009 и 010 остаются в реестре как история: сами
+      таблицы удалены миграцией 014, и реестр описывает путь базы, а не её
+      текущий снимок.
 
-migrations:
-  ledger_table: migrations
-  applied:
-    - 007_create_summaries
-    - 008_create_infom
-    - 009_create_neutered_summaries
-    - 010_create_forecasts
-    - 011_summaries_horizon_days
-  note: >
-    Нумерация историческая, с пропусками: 007-010 остались от времён, когда
-    корпус и проектная база были одним файлом. В новом проекте нумеруйте с 001
-    по DDL из SCHEMA.md — он уже учитывает все изменения.
+removed:
+  neutered_summaries:
+    removed_by: 014_drop_blind_prophet_tables
+    reason: >
+      результаты нейтрализации blind_prophet; entity neutering в первом
+      baseline этого проекта не применяется (D-004). Живёт в базе blind_prophet
+  forecasts:
+    removed_by: 014_drop_blind_prophet_tables
+    reason: >
+      persona-ensemble прогнозы blind_prophet, завязаны на набор персон и
+      модель. Живёт в базе blind_prophet
 
 # --- Контракт с корпусом --------------------------------------------------
 
@@ -97,7 +104,7 @@ corpus_contract:
   embedding_dim: 1536
   embedding_dtype: "<f4"
   embedding_input: lead             # вектор считается по началу сообщения
-  cached_axes:
+  cached_axes:                      # порядок значим: он задаёт порядок блоков мета-промпта
     - дкп
     - инфляция
     - продовольствие
@@ -108,20 +115,31 @@ corpus_contract:
     - кризис
     - бюджет
   axis_lookup_key: [axis, query_hash, embedding_model, dimension]
+  coverage_moscow_days: ["2016-03-22", "2026-04-11"]
+  coverage_note: >
+    Покрытие считается в полных московских сутках. MANIFEST корпуса даёт сырые
+    крайние таймстампы (2016-03-21T16:09:08+00:00, 2026-04-12T00:57:29+00:00) —
+    это не противоречие, а другой способ счёта: крайние дни неполны.
 
 # --- Ловушки --------------------------------------------------------------
 
 gotchas:
   - >
-    День run_date в окно сбора НЕ входит: границы сравниваются как строки
-    с полными ISO-таймстампами. Фактическое окно —
-    [run_date - horizon_days, run_date).
+    Окно сбора задано в МОСКОВСКОМ времени: [run_date - horizon_days, run_date),
+    день run_date исключён целиком. Голые календарные даты дают неверное окно со
+    сдвигом на три часа. Границы передаются полными ISO-таймстампами UTC.
+  - >
+    Строковое сравнение границ держится на однородности формата messages.date
+    (25 символов, суффикс +00:00 на всех 1 288 233 строках). В рантайме не
+    проверяется; пересборка корпуса с другим форматом сдвинет окно молча.
   - >
     Вектор оси выбирать только по полному ключу. Кеш query_vectors общий на
     все проекты, одноимённые оси с разными запросами лежат рядом.
   - >
-    Строки с judge_blind = 1 исключать из агрегированных оценок эффекта
-    нейтрализации: у них не сработал измеритель, а не нейтрализация.
+    Порядок осей — вход эксперимента. При склейке кешированных осей с
+    досчитанными восстанавливайте его явно, иначе мета-промпт меняется при тех
+    же данных.
   - >
-    Прогоны нейтрализации неоднородны по model_n (11 строк одной моделью,
-    2 другой). Сравнивая метрики между датами, учитывайте это.
+    Ключ кеша (run_date, horizon_days, model) не содержит правила часового
+    пояса, порядка осей и провайдера. Эти переменные фиксируются манифестом
+    прогона (D-025), а не базой.
