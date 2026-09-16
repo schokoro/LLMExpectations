@@ -41,10 +41,16 @@ corpus.enable_load_extension(False)
 rows = corpus.execute("""
     SELECT message_id, channel, date, processed_text, embedding
     FROM message_embeddings
-    WHERE date BETWEEN ? AND ?
-    ORDER BY date
-""", ("2023-04-17", "2023-05-01")).fetchall()
+    WHERE date >= ? AND date < ?
+    ORDER BY date, message_id
+""", (
+    "2023-04-16T21:00:00+00:00",
+    "2023-04-30T21:00:00+00:00",
+)).fetchall()
 ```
+
+Границы соответствуют полуночам 17 апреля и 1 мая по Москве. Правило см. в
+пункте 1 раздела «Три ловушки» ниже и в [SCHEMA.md, «Окно сбора»](SCHEMA.md#окно-сбора).
 
 `embedding` — сырые байты, 1536 × float32 little-endian:
 `np.frombuffer(blob, dtype="<f4")`.
@@ -71,10 +77,12 @@ rows = corpus.execute("""
 
 ## Три ловушки
 
-1. **День `run_date` в окно сбора не входит.** Границы сравниваются как строки
-   с полными ISO-таймстампами, поэтому фактическое окно —
-   `[run_date - horizon_days, run_date)`. Передадите границы как `datetime` —
-   получите другую выборку.
+1. **Окно задаётся в московском времени.** Это `[run_date - horizon_days, run_date)`:
+   `horizon_days` полных московских суток до дня опроса, сам день опроса исключён
+   целиком. **Прежняя ловушка инвертирована:** голые календарные даты дают неверное
+   окно со сдвигом на три часа — захватывают `00:00–03:00 MSK` дня опроса и
+   теряют те же три часа в начале. UTC-форма, правило покрытия и примечание об
+   устаревших строках `summaries` — в `SCHEMA.md`, раздел «Окно сбора».
 2. **Вектор оси выбирайте по полному ключу** `(axis, query_hash,
    embedding_model, dimension)`, а не по одному имени. Кеш `query_vectors`
    общий на все проекты, одноимённые оси с разными запросами лежат рядом;

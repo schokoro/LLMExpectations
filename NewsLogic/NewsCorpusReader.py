@@ -10,6 +10,7 @@ import sqlite_vec
 
 from NewsLogic import NewsRagConfiguration as newsRagConfiguration
 from NewsLogic.newsExceptions import NewsContextError
+from NewsLogic.newsHelpers import moscowDate
 
 
 def canonicalQueryList(queries: list[str]) -> str:
@@ -93,23 +94,23 @@ class NewsCorpusReader:
         `corpus_end` — ночь), поэтому в покрытие они не входят.
         """
         meta = self.getCorpusMeta()
-        corpusStart = self._parseTimestamp(meta, 'corpus_start')
-        corpusEnd = self._parseTimestamp(meta, 'corpus_end')
+        corpusStart = self._getTimestamp(meta, 'corpus_start')
+        corpusEnd = self._getTimestamp(meta, 'corpus_end')
 
-        return corpusStart.date() + timedelta(days=1), corpusEnd.date() - timedelta(days=1)
+        return moscowDate(corpusStart) + timedelta(days=1), moscowDate(corpusEnd) - timedelta(days=1)
 
     def loadWindow(
         self,
-        windowFrom: date,
-        runDate: date,
+        windowFromUtc: datetime,
+        windowToExclusiveUtc: datetime,
         excludeChannels: tuple[str, ...] = (),
     ) -> list[dict]:
-        """Сообщения с эмбеддингами за окно `[windowFrom, runDate)`.
+        """Сообщения с эмбеддингами между явными UTC-моментами границ.
 
-        Верхняя граница исключающая и задана явно: день опроса в выборку не
-        входит. Границы сравниваются со строковыми ISO-таймстампами корпуса,
-        поэтому голая дата `'2020-04-20'` меньше любого таймстампа этого дня.
-        Передача границ как `datetime` дала бы другую выборку.
+        UTC-границы получены из московских полуночей; верхняя исключающая, поэтому
+        московский день опроса не входит. Все timestamp корпуса имеют единый
+        формат с суффиксом `+00:00`, поэтому строковое сравнение совпадает с
+        хронологическим.
 
         Порядок `(date, message_id)` — не `date`, как в blind_prophet: на
         одинаковых таймстампах порядок иначе не определён, а от него зависят и
@@ -120,7 +121,7 @@ class NewsCorpusReader:
             FROM message_embeddings
             WHERE date >= ? AND date < ?
         """
-        parameters: list = [windowFrom.isoformat(), runDate.isoformat()]
+        parameters: list = [windowFromUtc.isoformat(), windowToExclusiveUtc.isoformat()]
 
         if excludeChannels:
             placeholders = ','.join('?' * len(excludeChannels))
@@ -196,9 +197,9 @@ class NewsCorpusReader:
         return self.connection
 
     @staticmethod
-    def _parseTimestamp(meta: dict[str, str], key: str) -> datetime:
+    def _getTimestamp(meta: dict[str, str], key: str) -> str:
         value = meta.get(key)
         if not value:
             raise NewsContextError(f'В corpus_meta нет ключа {key}')
 
-        return datetime.fromisoformat(value)
+        return value

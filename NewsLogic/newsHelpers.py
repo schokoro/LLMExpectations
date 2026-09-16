@@ -1,6 +1,8 @@
 import os
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
+
+from NewsLogic.NewsRagConfiguration import moscowTimeZone
 
 defaultEnvironmentFile = Path('.env')
 
@@ -49,3 +51,20 @@ def asDate(surveyDate) -> date:
         return surveyDate
 
     raise TypeError(f'Survey date must be date or datetime, got {type(surveyDate)}')
+
+
+def moscowDate(corpusTimestamp: str) -> date:
+    """Московская дата timestamp корпуса нужна для cutoff и нумерации дней.
+
+    Корпус хранит время в UTC, а контракт окна задан календарными сутками MSK.
+    """
+    return datetime.fromisoformat(corpusTimestamp).astimezone(moscowTimeZone).date()
+
+
+def moscowDayStartUtc(moscowDay: date) -> datetime:
+    """UTC-момент начала московских суток нужен как явная граница SQL-окна.
+
+    Так день опроса исключается по правилу MSK, а не из-за сравнения форматов.
+    """
+    moscowMidnight = datetime.combine(moscowDay, time.min, tzinfo=moscowTimeZone)
+    return moscowMidnight.astimezone(UTC)

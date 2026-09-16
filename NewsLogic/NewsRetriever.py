@@ -7,6 +7,7 @@ from Logging.BaseLogger import BaseLogger
 from NewsLogic.NewsCorpusReader import NewsCorpusReader
 from NewsLogic.NewsDocument import NewsDocument
 from NewsLogic.newsExceptions import NewsContextError, NewsContextUnavailableError
+from NewsLogic.newsHelpers import moscowDate, moscowDayStartUtc
 from NewsLogic.NewsRagConfiguration import NewsRagConfiguration
 
 
@@ -28,12 +29,18 @@ class NewsRetriever:
 
     def retrieve(self, runDate: date) -> dict[str, list[NewsDocument]]:
         windowFrom, windowToExclusive = self.getWindow(runDate)
+        windowFromUtc = moscowDayStartUtc(windowFrom)
+        windowToExclusiveUtc = moscowDayStartUtc(windowToExclusive)
 
         with NewsCorpusReader(self.configuration.corpusPath) as reader:
             reader.assertCorpusContract()
             self._assertCoverage(reader, windowFrom, windowToExclusive)
 
-            rows = reader.loadWindow(windowFrom, runDate, self.configuration.excludeChannels)
+            rows = reader.loadWindow(
+                windowFromUtc,
+                windowToExclusiveUtc,
+                self.configuration.excludeChannels,
+            )
             if not rows:
                 raise NewsContextError(
                     f'В окне [{windowFrom}, {runDate}) нет ни одного сообщения. '
@@ -120,7 +127,7 @@ class NewsRetriever:
 
     @staticmethod
     def _getDayNumber(publishedAt: str, windowFrom: date) -> int:
-        publishedDay = date.fromisoformat(publishedAt[:10])
+        publishedDay = moscowDate(publishedAt)
         return (publishedDay - windowFrom).days + 1
 
     @staticmethod

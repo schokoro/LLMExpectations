@@ -19,7 +19,7 @@ from NewsLogic.newsExceptions import (
     NewsContextNotPreparedError,
     NewsContextUnavailableError,
 )
-from NewsLogic.newsHelpers import readSecret
+from NewsLogic.newsHelpers import moscowDate, readSecret
 from NewsLogic.NewsRagConfiguration import NewsRagConfiguration, rawMode, twoStageMode
 from NewsLogic.NewsRetriever import NewsRetriever
 from NewsLogic.newsSectionRenderer import renderNewsSection
@@ -141,14 +141,15 @@ class TestNewsRetrievalCutoff(NewsFixtureTestCase):
 
         for axis, documents in retrieved.items():
             for document in documents:
-                self.assertLess(document.publishedAt, newsFixtures.runDate,
+                self.assertLess(moscowDate(document.publishedAt),
+                                date.fromisoformat(newsFixtures.runDate),
                                 f'Ось {axis}: документ {document.messageId} не старше даты опроса')
 
     def test_last_day_before_the_survey_day_is_included(self):
         retrieved = self.retrieve()
 
         messageIds = {document.messageId for document in retrieved[newsFixtures.firstAxis]}
-        self.assertIn(4, messageIds, 'Сообщение за день до опроса должно попасть в выдачу')
+        self.assertIn(12, messageIds, 'Сообщение за день до опроса должно попасть в выдачу')
 
     def test_survey_day_messages_are_excluded(self):
         retrieved = self.retrieve()
@@ -165,7 +166,19 @@ class TestNewsRetrievalCutoff(NewsFixtureTestCase):
         messageIds = {document.messageId
                       for documents in retrieved.values()
                       for document in documents}
-        self.assertNotIn(1, messageIds, 'Сообщение накануне окна не должно попадать в выдачу')
+        self.assertNotIn(11, messageIds, 'Сообщение накануне окна не должно попадать в выдачу')
+
+    def test_both_window_bounds_follow_moscow_midnights(self):
+        retrieved = self.retrieve()
+
+        messageIds = {document.messageId
+                      for documents in retrieved.values()
+                      for document in documents}
+
+        self.assertNotIn(11, messageIds, '23:59 MSK перед первым днём окна')
+        self.assertIn(1, messageIds, '02:50 MSK первого дня окна')
+        self.assertIn(12, messageIds, '23:30 MSK последнего дня окна')
+        self.assertNotIn(4, messageIds, '02:59 MSK дня опроса')
 
     def test_day_numbers_start_at_the_first_day_of_the_window(self):
         retrieved = self.retrieve()
@@ -173,7 +186,15 @@ class TestNewsRetrievalCutoff(NewsFixtureTestCase):
         dayNumbers = {document.messageId: document.dayNumber
                       for document in retrieved[newsFixtures.firstAxis]}
 
-        self.assertEqual({2: 1, 3: 2, 4: 3}, dayNumbers)
+        self.assertEqual({1: 1, 2: 1, 3: 2, 12: 3}, dayNumbers)
+
+    def test_day_number_comes_from_the_moscow_publication_date(self):
+        retrieved = self.retrieve()
+
+        dayNumbers = {document.messageId: document.dayNumber
+                      for document in retrieved[newsFixtures.firstAxis]}
+
+        self.assertEqual(1, dayNumbers[1])
 
 
 class TestNewsRetrievalSelection(NewsFixtureTestCase):
@@ -220,8 +241,7 @@ class TestNewsRetrievalSelection(NewsFixtureTestCase):
 
         messageIds = {document.messageId for document in retrieved[newsFixtures.firstAxis]}
 
-        self.assertIn(2, messageIds)
-        self.assertNotIn(4, messageIds)
+        self.assertEqual({1, 2}, messageIds)
 
     def test_documents_are_ordered_by_day(self):
         retrieved = self.retrieve()
@@ -235,8 +255,9 @@ class TestNewsRetrievalSelection(NewsFixtureTestCase):
 
         scores = {document.messageId: document.score for document in retrieved[newsFixtures.firstAxis]}
 
+        self.assertGreater(scores[1], scores[2])
         self.assertGreater(scores[2], scores[3])
-        self.assertGreater(scores[3], scores[4])
+        self.assertGreater(scores[3], scores[12])
 
 
 class TestNewsRetrievalCoverage(NewsFixtureTestCase):
@@ -246,7 +267,17 @@ class TestNewsRetrievalCoverage(NewsFixtureTestCase):
 
     def test_date_after_corpus_coverage_is_unavailable(self):
         with self.assertRaises(NewsContextUnavailableError):
+            self.retrieve(date(2022, 4, 3))
+
+    def test_first_utc_coverage_day_is_not_a_full_moscow_day(self):
+        with self.assertRaises(NewsContextUnavailableError):
+            self.retrieve(date(2022, 3, 5))
+
+    def test_last_full_moscow_day_is_covered(self):
+        with self.assertRaises(NewsContextError) as raised:
             self.retrieve(date(2022, 4, 2))
+
+        self.assertNotIsInstance(raised.exception, NewsContextUnavailableError)
 
     def test_empty_window_is_a_loud_failure(self):
         with self.assertRaises(NewsContextError):

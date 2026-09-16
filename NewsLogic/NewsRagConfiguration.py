@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field, replace
+from datetime import timedelta, timezone
 from pathlib import Path
 
 # Контракт корпуса. Несовпадение любого из этих значений означает, что векторы
@@ -9,6 +10,8 @@ corpusEmbeddingModel = 'ai-forever/FRIDA'
 corpusEmbeddingDimension = 1536
 corpusEmbeddingDtype = '<f4'
 corpusEmbeddingInput = 'lead'
+moscowUtcOffsetHours = 3
+moscowTimeZone = timezone(timedelta(hours=moscowUtcOffsetHours))
 
 twoStageMode = 'two_stage'
 rawMode = 'raw'

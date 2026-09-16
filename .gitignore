@@ -248,8 +248,11 @@ CLAUDE.md
 data/Target profiles/
 data/RLMS waves/
 Configuration/*_key.txt
-data/newsDB/*.db
 data/SurveyResults/
 notebooks/
 tmp/
 .idea/
+data/newsDB/*.db
+data/newsDB/*.db-wal
+data/newsDB/*.db-shm
+data/newsDB/*.db-journal
