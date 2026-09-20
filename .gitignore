@@ -256,3 +256,5 @@ data/newsDB/*.db
 data/newsDB/*.db-wal
 data/newsDB/*.db-shm
 data/newsDB/*.db-journal
+data/newsDB/*.bak-*
+data/*.txz
