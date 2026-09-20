@@ -643,7 +643,7 @@ requires-dist = [
 dev = [
     { name = "marimo", specifier = ">=0.24" },
     { name = "pytest", specifier = ">=8.3" },
-    { name = "ruff", specifier = ">=0.16" },
+    { name = "ruff", specifier = "==0.16.5" },
 ]
 
 [[package]]

@@ -22,7 +22,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.3",
-    "ruff>=0.16",
+    "ruff==0.16.5",
     "marimo>=0.24",
 ]
 
@@ -37,3 +37,14 @@ amnesiac = { git = "https://github.com/schokoro/amnesiac", tag = "v0.2.0" }
 # и взял корень проекта за rootdir. Тесты читают данные относительными путями
 # ../data/*, поэтому запускаются из каталога Tests:
 #   cd Tests && ../.venv/bin/python -m pytest -q
+
+[tool.ruff]
+# Фиксируем измеренный стиль дерева: одинарные кавычки и строки до 100 символов,
+# а не дефолты ruff; имена тестовых модулей сохраняют унаследованный стиль.
+line-length = 100
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint.per-file-ignores]
+"Tests/**" = ["N999"]
