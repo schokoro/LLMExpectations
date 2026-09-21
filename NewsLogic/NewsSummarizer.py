@@ -1,5 +1,11 @@
 from amnesiac import Doc
-from amnesiac.summarize import SummarizeConfig, SummarizeResult, summarize
+from amnesiac.summarize import (
+    AxisSummariesResult,
+    MetaResult,
+    SummarizeConfig,
+    summarize_axes,
+    summarize_meta,
+)
 from amnesiac.summarize.prompts import RU_MACRO_V1
 from openai import AsyncOpenAI
 
@@ -22,7 +28,9 @@ class NewsSummarizer:
         self.configuration = configuration
         self.logger = logger
 
-    async def buildSummary(self, retrieved: dict[str, list[NewsDocument]]) -> SummarizeResult:
+    async def buildAxisSummaries(
+        self, retrieved: dict[str, list[NewsDocument]]
+    ) -> AxisSummariesResult:
         client = AsyncOpenAI(
             base_url=self.configuration.summarizeBaseUrl,
             api_key=self._getApiKey(),
@@ -47,7 +55,7 @@ class NewsSummarizer:
             f'over {len(axes)} axes with {self.configuration.summarizeModel}'
         )
 
-        result = await summarize(
+        result = await summarize_axes(
             client=client,
             model=self.configuration.summarizeModel,
             axes=axes,
@@ -66,6 +74,25 @@ class NewsSummarizer:
             )
 
         return result
+
+    async def buildMetaSummary(self, axisSummaries: dict[str, str]) -> MetaResult:
+        client = AsyncOpenAI(
+            base_url=self.configuration.summarizeBaseUrl,
+            api_key=self._getApiKey(),
+            timeout=self.configuration.summarizeTimeout,
+        )
+
+        return await summarize_meta(
+            client=client,
+            model=self.configuration.summarizeModel,
+            axis_summaries=axisSummaries,
+            prompts=RU_MACRO_V1.bind(horizon_days=self.configuration.horizonDays),
+            config=SummarizeConfig(
+                temperature=self.configuration.summarizeTemperature,
+                concurrency=self.configuration.summarizeConcurrency,
+                max_failed_axes=self.configuration.summarizeMaxFailedAxes,
+            ),
+        )
 
     def _getApiKey(self) -> str:
         key = readSecret(self.configuration.summarizeApiKeyVariable)

@@ -12,6 +12,10 @@ from NewsLogic import NewsRagConfiguration as newsRagConfiguration
 from NewsLogic.newsExceptions import NewsContextError
 from NewsLogic.newsHelpers import moscowDate
 
+# Полный скан messages дорог: успешная проверка кешируется на весь процесс.
+# Ключ — разрешённый путь, размер и mtime_ns файла; перестройка меняет ключ.
+corpusDateFormatChecks: dict[tuple[Path, int, int], bool] = {}
+
 
 def canonicalQueryList(queries: list[str]) -> str:
     """Сериализация списка запросов ровно так, как её делал amnesiacDB."""
@@ -60,7 +64,7 @@ class NewsCorpusReader:
             self.connection = None
 
     def assertCorpusContract(self) -> None:
-        """Сверить модель эмбеддингов и версию схемы: несовпадение не видно снаружи."""
+        """Сверить эмбеддинги, схему и формат дат до отбора окна."""
         meta = self.getCorpusMeta()
 
         expected = {
@@ -78,6 +82,32 @@ class NewsCorpusReader:
                     f'Контракт корпуса нарушен: {key} = {actualValue!r}, ожидалось {expectedValue!r}. '
                     f'Векторы несовместимы, продолжать нельзя.'
                 )
+
+        resolvedPath = self.corpusPath.resolve()
+        statistics = resolvedPath.stat()
+        corpusIdentity = (resolvedPath, statistics.st_size, statistics.st_mtime_ns)
+        if corpusIdentity not in corpusDateFormatChecks:
+            rowCount, invalidCount = self._getConnection().execute(
+                'SELECT COUNT(*), COALESCE(SUM(date NOT GLOB ?), 0) FROM messages',
+                (newsRagConfiguration.corpusDatePattern,),
+            ).fetchone()
+            if rowCount == 0:
+                raise NewsContextError(
+                    'Контракт корпуса нарушен: messages.date — корпус пуст (0 строк). '
+                    'Границам окна доверять нельзя.'
+                )
+            if invalidCount:
+                invalidValues = self._getConnection().execute(
+                    'SELECT date FROM messages WHERE date NOT GLOB ? LIMIT 3',
+                    (newsRagConfiguration.corpusDatePattern,),
+                ).fetchall()
+                raise NewsContextError(
+                    f'Контракт корпуса нарушен: messages.date — нарушений: {invalidCount}, '
+                    f'примеры: {[row[0] for row in invalidValues]!r}, '
+                    f'ожидался шаблон {newsRagConfiguration.corpusDatePattern!r}. '
+                    f'Границам окна доверять нельзя.'
+                )
+            corpusDateFormatChecks[corpusIdentity] = True
 
     def getCorpusMeta(self) -> dict[str, str]:
         try:
@@ -142,6 +172,25 @@ class NewsCorpusReader:
             }
             for row in rows
         ]
+
+    def countBandMessages(
+        self,
+        bandFromUtc: datetime,
+        bandToExclusiveUtc: datetime,
+        excludeChannels: tuple[str, ...] = (),
+    ) -> int:
+        """Число сообщений с эмбеддингами в UTC-полосе для живого cutoff-гейта."""
+        sql = """
+            SELECT COUNT(*) FROM message_embeddings
+            WHERE date >= ? AND date < ?
+        """
+        parameters: list = [bandFromUtc.isoformat(), bandToExclusiveUtc.isoformat()]
+        if excludeChannels:
+            placeholders = ','.join('?' * len(excludeChannels))
+            sql += f' AND channel NOT IN ({placeholders})'
+            parameters.extend(excludeChannels)
+
+        return self._getConnection().execute(sql, parameters).fetchone()[0]
 
     def getAxisVector(self, axis: str, queries: list[str]) -> np.ndarray | None:
         """Вектор оси по ПОЛНОМУ ключу.

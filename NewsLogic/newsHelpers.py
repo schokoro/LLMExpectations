@@ -2,6 +2,7 @@ import os
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 
+from NewsLogic.newsExceptions import NewsContextError
 from NewsLogic.NewsRagConfiguration import moscowTimeZone
 
 defaultEnvironmentFile = Path('.env')
@@ -58,7 +59,12 @@ def moscowDate(corpusTimestamp: str) -> date:
 
     Корпус хранит время в UTC, а контракт окна задан календарными сутками MSK.
     """
-    return datetime.fromisoformat(corpusTimestamp).astimezone(moscowTimeZone).date()
+    timestamp = datetime.fromisoformat(corpusTimestamp)
+    if timestamp.tzinfo is None:
+        raise NewsContextError(
+            f'Отклонён timestamp {corpusTimestamp!r}: контракт корпуса требует явного смещения UTC.'
+        )
+    return timestamp.astimezone(moscowTimeZone).date()
 
 
 def moscowDayStartUtc(moscowDay: date) -> datetime:

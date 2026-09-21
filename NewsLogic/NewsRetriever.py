@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import numpy as np
 from amnesiac.select import select_by_axis
@@ -27,10 +27,16 @@ class NewsRetriever:
         """Окно `[runDate - horizonDays, runDate)`. День опроса не входит."""
         return runDate - timedelta(days=self.configuration.horizonDays), runDate
 
-    def retrieve(self, runDate: date) -> dict[str, list[NewsDocument]]:
+    def getWindowUtcBounds(self, runDate: date) -> tuple[datetime, datetime]:
+        """Явные UTC-границы окна московских суток."""
         windowFrom, windowToExclusive = self.getWindow(runDate)
         windowFromUtc = moscowDayStartUtc(windowFrom)
         windowToExclusiveUtc = moscowDayStartUtc(windowToExclusive)
+        return windowFromUtc, windowToExclusiveUtc
+
+    def retrieve(self, runDate: date) -> dict[str, list[NewsDocument]]:
+        windowFrom, windowToExclusive = self.getWindow(runDate)
+        windowFromUtc, windowToExclusiveUtc = self.getWindowUtcBounds(runDate)
 
         with NewsCorpusReader(self.configuration.corpusPath) as reader:
             reader.assertCorpusContract()

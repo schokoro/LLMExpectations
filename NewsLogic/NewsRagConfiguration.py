@@ -10,6 +10,9 @@ corpusEmbeddingModel = 'ai-forever/FRIDA'
 corpusEmbeddingDimension = 1536
 corpusEmbeddingDtype = '<f4'
 corpusEmbeddingInput = 'lead'
+corpusDatePattern = (
+    '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00'
+)
 moscowUtcOffsetHours = 3
 moscowTimeZone = timezone(timedelta(hours=moscowUtcOffsetHours))
 
@@ -56,14 +59,6 @@ class NewsRagConfiguration:
     summarizeConcurrency: int = 5
     summarizeMaxFailedAxes: int = 2
     summarizeTimeout: float = 600.0
-    # Повтор всей даты при сбое суммаризации. С `amnesiac` 0.2 пустой ответ модели
-    # ретраится уже внутри пакета (D-028), а вот превышение лимита отказавших осей
-    # транзиентным отказом не считается и уходит наверх с первой попытки. Одна такая
-    # ошибка роняет прогон целиком, поэтому повтор живёт здесь.
-    # Попытки перемножаются: неудачная дата стоит до summarizeAttempts × max_attempts
-    # обращений на вызов и выдерживает паузы обоих уровней.
-    summarizeAttempts: int = 3
-    summarizeRetryDelaySeconds: float = 30.0
 
     corpusPath: Path = Path('data/newsDB/corpus.db')
     projectDbPath: Path = Path('data/newsDB/project.db')
@@ -78,12 +73,6 @@ class NewsRagConfiguration:
             raise ValueError(f'topKPerAxis must be positive, got {self.topKPerAxis}')
         if not self.axes:
             raise ValueError('axes cannot be empty')
-        if self.summarizeAttempts < 1:
-            raise ValueError(f'summarizeAttempts must be at least 1, got {self.summarizeAttempts}')
-        if self.summarizeRetryDelaySeconds < 0:
-            raise ValueError(
-                f'summarizeRetryDelaySeconds cannot be negative, got {self.summarizeRetryDelaySeconds}'
-            )
 
     def withArtefactsFolder(self, artefactsFolder: Path) -> 'NewsRagConfiguration':
         return replace(self, artefactsFolder=artefactsFolder)

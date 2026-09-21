@@ -1,9 +1,8 @@
 import asyncio
 import json
-import time
 from datetime import date
 
-from amnesiac.exceptions import SummarizeError
+from amnesiac.summarize import TooManyAxisFailures, Usage
 
 from Logging.BaseLogger import BaseLogger
 from NewsLogic import NewsRagConfiguration as newsRagConfiguration
@@ -123,67 +122,67 @@ class NewsContextProvider:
 
             return summary, failedAxes, True
 
-        result = self._runSummarization(retrieved)
-        documentsCount = sum(len(documents) for documents in retrieved.values())
-
-        self.summariesCache.saveSummary(
-            runDate,
-            self.configuration.horizonDays,
-            result.meta,
-            documentsCount,
-            self.configuration.summarizeModel,
-            tuple(result.failed_axes),
-        )
-
-        # Осевые саммари первого этапа: провенанс меты и материал для анализа по
-        # осям. Отказавшие оси пропускаются — вместо текста там заглушка.
-        failed = set(result.failed_axes)
-        self.summariesCache.saveAxisSummaries(
-            runDate,
-            self.configuration.horizonDays,
-            self.configuration.summarizeModel,
-            {axis: summary for axis, summary in result.axis_summaries.items() if axis not in failed},
-            {axis: len(documents) for axis, documents in retrieved.items()},
-        )
-
-        self.logger.logDebug(
-            f'News summary for {runDate} computed: {len(result.meta)} characters, '
-            f'{result.usage.calls} provider calls, {result.usage.total_tokens} tokens'
-        )
-
-        return result.meta, tuple(result.failed_axes), False
-
-    def _runSummarization(self, retrieved: dict):
         if self._hasRunningEventLoop():
             raise RuntimeError(
                 'NewsContextProvider.prepare() вызван внутри работающего event loop. '
                 'Контекст считается до запуска опроса, а не во время него.'
             )
 
-        attempts = self.configuration.summarizeAttempts
-        for attempt in range(1, attempts + 1):
+        horizonDays = self.configuration.horizonDays
+        model = self.configuration.summarizeModel
+        documentCounts = {axis: len(documents) for axis, documents in retrieved.items()}
+        cachedAxes = self.summariesCache.getAxisSummaries(runDate, horizonDays, model)
+        missing = {
+            axis: documents for axis, documents in retrieved.items() if axis not in cachedAxes
+        }
+
+        if missing:
             try:
-                return asyncio.run(self.summarizer.buildSummary(retrieved))
-            except SummarizeError as error:
-                # Повторяются только сбои суммаризации: пустой ответ модели и
-                # превышение лимита отказавших осей. Ошибки конфигурации и
-                # шаблонов — не подкласс SummarizeError и наверх уходят сразу,
-                # потому что повтор их не исправит.
-                if attempt >= attempts:
-                    self.logger.logDebug(
-                        f'Summarization failed after {attempts} attempts: {error}'
-                    )
-                    raise
-
-                self.logger.logDebug(
-                    f'Summarization attempt {attempt}/{attempts} failed: {error}. '
-                    f'Retrying in {self.configuration.summarizeRetryDelaySeconds} s '
-                    f'(the whole date is recomputed: amnesiac 0.2 carries the computed axis '
-                    f'summaries on the exception, but this retry does not use them yet).'
+                axesResult = asyncio.run(self.summarizer.buildAxisSummaries(missing))
+            except TooManyAxisFailures as error:
+                self.summariesCache.saveAxisSummaries(
+                    runDate, horizonDays, model, error.axis_summaries, documentCounts
                 )
-                time.sleep(self.configuration.summarizeRetryDelaySeconds)
+                raise
 
-        raise AssertionError('unreachable: цикл повторов либо возвращает результат, либо бросает')
+            failed = set(axesResult.failed_axes)
+            self.summariesCache.saveAxisSummaries(
+                runDate,
+                horizonDays,
+                model,
+                {
+                    axis: summary
+                    for axis, summary in axesResult.axis_summaries.items()
+                    if axis not in failed
+                },
+                documentCounts,
+            )
+            ready = cachedAxes | axesResult.axis_summaries
+            failedAxes = tuple(axesResult.failed_axes)
+            usage = axesResult.usage
+        else:
+            ready, failedAxes, usage = cachedAxes, (), Usage()
+
+        # Порядок осей — часть входа мета-промпта, в том числе при досчёте хвоста.
+        merged = {axis: ready[axis] for axis in retrieved}
+        metaResult = asyncio.run(self.summarizer.buildMetaSummary(merged))
+        usage = usage + metaResult.usage
+
+        self.summariesCache.saveSummary(
+            runDate,
+            horizonDays,
+            metaResult.meta,
+            sum(documentCounts.values()),
+            model,
+            failedAxes,
+        )
+
+        self.logger.logDebug(
+            f'News summary for {runDate} computed: {len(metaResult.meta)} characters, '
+            f'{usage.calls} provider calls, {usage.total_tokens} tokens'
+        )
+
+        return metaResult.meta, failedAxes, False
 
     @staticmethod
     def _hasRunningEventLoop() -> bool:

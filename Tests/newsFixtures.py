@@ -81,7 +81,7 @@ def buildAxisVector(index: int) -> np.ndarray:
     return vector
 
 
-def createCorpusFixture(path: Path) -> Path:
+def createCorpusFixture(path: Path, withForeignTimestamp: bool | str = False) -> Path:
     """Создать корпус-фикстуру со схемой боевого корпуса."""
     connection = sqlite3.connect(str(path))
     connection.enable_load_extension(True)
@@ -176,6 +176,11 @@ def createCorpusFixture(path: Path) -> Path:
             )
 
     for messageId, channelName, publishedAt, isValid, hasEmbedding, angle, noiseIndex, text in fixtureMessages:
+        if withForeignTimestamp and messageId == 3:
+            publishedAt = (
+                withForeignTimestamp if isinstance(withForeignTimestamp, str)
+                else '2022-03-23 12:00:00'
+            )
         connection.execute(
             'INSERT INTO messages (id, channel_id, tg_message_id, text, date) VALUES (?, ?, ?, ?, ?)',
             (messageId, channels[channelName], messageId, text, publishedAt),

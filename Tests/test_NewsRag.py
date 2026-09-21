@@ -3,16 +3,23 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 
-from amnesiac.exceptions import ConfigurationError, SummarizeError, TooManyAxisFailures
+from amnesiac.summarize import (
+    AxisSummariesResult,
+    MetaResult,
+    MetaSummaryError,
+    TooManyAxisFailures,
+    Usage,
+)
 
 from Logging.BaseLogger import BaseLogger
 from NewsLogic.NewsContext import NewsContext
 from NewsLogic.NewsContextProvider import NewsContextProvider
+from NewsLogic.NewsCorpusReader import NewsCorpusReader
 from NewsLogic.NewsDocument import NewsDocument
 from NewsLogic.newsExceptions import (
     NewsContextError,
@@ -41,66 +48,49 @@ class SilentLogger(BaseLogger):
         self.messages.append(str(obj))
 
 
-@dataclass
-class StubUsage:
-    calls: int = 1
-    total_tokens: int = 100
-
-
-@dataclass
-class StubSummarizeResult:
-    meta: str
-    failed_axes: list[str]
-    usage: StubUsage
-    axis_summaries: dict[str, str] = field(default_factory=dict)
-
-
 class StubSummarizer:
     """Провайдер в тестах не вызывается: сеть в гейте тестов запрещена."""
 
     def __init__(self, meta: str = 'мета-саммари', failedAxes: tuple[str, ...] = ()):
         self.meta = meta
         self.failedAxes = failedAxes
-        self.calls = 0
+        self.axisInputs = []
+        self.metaInputs = []
+        self.axisUsage = Usage(calls=2, total_tokens=100)
+        self.metaUsage = Usage(calls=1, total_tokens=37)
+        self.axisError = None
+        self.metaError = None
 
-    async def buildSummary(self, retrieved) -> StubSummarizeResult:
-        self.calls += 1
+    async def buildAxisSummaries(self, retrieved) -> AxisSummariesResult:
+        self.axisInputs.append(retrieved)
+        if self.axisError is not None:
+            raise self.axisError
 
-        # Как в amnesiac: отказавшая ось присутствует в axis_summaries, но с
-        # заглушкой вместо текста.
+        # Как в amnesiac: отказавшая ось передаётся в мету с заглушкой.
         axisSummaries = {
             axis: (failedAxisPlaceholder if axis in self.failedAxes else f'саммари оси {axis}')
             for axis in retrieved
         }
+        return AxisSummariesResult(
+            failed_axes=list(self.failedAxes),
+            axis_errors={axis: 'ошибка провайдера' for axis in self.failedAxes},
+            usage=self.axisUsage,
+            axis_summaries=axisSummaries,
+        )
 
-        return StubSummarizeResult(meta=self.meta, failed_axes=list(self.failedAxes),
-                                   usage=StubUsage(), axis_summaries=axisSummaries)
+    async def buildMetaSummary(self, axisSummaries) -> MetaResult:
+        self.metaInputs.append(axisSummaries)
+        if self.metaError is not None:
+            raise self.metaError
+        return MetaResult(meta=self.meta, usage=self.metaUsage)
 
 
 class ExplodingSummarizer:
-    async def buildSummary(self, retrieved):
+    async def buildAxisSummaries(self, retrieved):
         raise AssertionError('Суммаризация вызвана при попадании в кеш')
 
-
-class FlakySummarizer(StubSummarizer):
-    """Падает заданное число раз, потом отдаёт результат.
-
-    Воспроизводит наблюдавшийся сбой: провайдер отвечает успешно, но с пустым
-    содержимым, и `amnesiac` превращает это в `SummarizeError`.
-    """
-
-    def __init__(self, failuresBeforeSuccess: int, error: Exception | None = None):
-        super().__init__('саммари со второй попытки')
-        self.failuresBeforeSuccess = failuresBeforeSuccess
-        self.error = error or SummarizeError('Model returned empty content for meta summary')
-
-    async def buildSummary(self, retrieved):
-        if self.calls < self.failuresBeforeSuccess:
-            self.calls += 1
-            raise self.error
-
-        # Счётчик увеличивает базовый класс, поэтому calls == отказы + успехи.
-        return await super().buildSummary(retrieved)
+    async def buildMetaSummary(self, axisSummaries):
+        raise AssertionError('Суммаризация вызвана при попадании в кеш')
 
 
 class NewsFixtureTestCase(TestCase):
@@ -133,6 +123,87 @@ class NewsFixtureTestCase(TestCase):
         retriever = NewsRetriever(self.createConfiguration(**overrides), SilentLogger())
 
         return retriever.retrieve(runDate or date.fromisoformat(newsFixtures.runDate))
+
+
+class TestCorpusTimestampContract(NewsFixtureTestCase):
+    def test_corpus_with_a_foreign_timestamp_format_is_rejected(self):
+        corpusPath = newsFixtures.createCorpusFixture(
+            self.folder / 'foreign.db', withForeignTimestamp=True
+        )
+        with self.assertRaisesRegex(NewsContextError, r'messages\.date'):
+            self.retrieve(corpusPath=corpusPath)
+
+    def test_corpus_with_a_space_separated_timestamp_is_rejected(self):
+        timestamp = '2022-03-23 12:00:00+00:00'
+        corpusPath = newsFixtures.createCorpusFixture(
+            self.folder / 'spaceSeparated.db', withForeignTimestamp=timestamp
+        )
+        with self.assertRaisesRegex(NewsContextError, r'messages\.date') as raised:
+            self.retrieve(corpusPath=corpusPath)
+        self.assertIn('нарушений: 1', str(raised.exception))
+        self.assertIn(repr(timestamp), str(raised.exception))
+
+    def test_the_timestamp_format_is_checked_before_the_window_is_loaded(self):
+        corpusPath = newsFixtures.createCorpusFixture(
+            self.folder / 'foreignOrder.db', withForeignTimestamp=True
+        )
+        # Без проверки формата это окно непустое, несмотря на испорченную строку.
+        with NewsCorpusReader(corpusPath) as reader:
+            rows = reader.loadWindow(
+                datetime.fromisoformat('2022-03-21T21:00:00+00:00'),
+                datetime.fromisoformat('2022-03-24T21:00:00+00:00'),
+            )
+            self.assertTrue(rows)
+        with patch.object(NewsCorpusReader, 'loadWindow', autospec=True) as loadWindow:
+            with self.assertRaisesRegex(NewsContextError, r'messages\.date'):
+                self.retrieve(corpusPath=corpusPath)
+            loadWindow.assert_not_called()
+
+    def test_a_well_formed_corpus_passes_the_format_check(self):
+        with NewsCorpusReader(self.corpusPath) as reader:
+            reader.assertCorpusContract()
+        self.assertEqual(
+            newsFixtures.inWindowMessageIds,
+            [document.messageId for document in self.retrieve()[newsFixtures.firstAxis]],
+        )
+
+    def test_timestamp_scan_is_cached_across_readers_but_metadata_is_checked(self):
+        corpusPath = newsFixtures.createCorpusFixture(self.folder / 'cachedFormat.db')
+        queries = []
+        for _ in range(2):
+            with NewsCorpusReader(corpusPath) as reader:
+                reader.connection.set_trace_callback(queries.append)
+                reader.assertCorpusContract()
+        self.assertEqual(1, sum('FROM messages' in query for query in queries))
+        self.assertEqual(2, sum('FROM corpus_meta' in query for query in queries))
+
+    def test_changed_corpus_identity_rechecks_timestamp_format(self):
+        corpusPath = newsFixtures.createCorpusFixture(self.folder / 'changedFormat.db')
+        with NewsCorpusReader(corpusPath) as reader:
+            reader.assertCorpusContract()
+        statistics = corpusPath.stat()
+        with sqlite3.connect(corpusPath) as connection:
+            connection.execute("UPDATE messages SET date = '2022-03-23 12:00:00' WHERE id = 3")
+        # Явный сдвиг исключает зависимость теста от точности часов файловой системы.
+        os.utime(corpusPath, ns=(statistics.st_atime_ns, statistics.st_mtime_ns + 1000000000))
+        with self.assertRaisesRegex(NewsContextError, r'messages\.date'):
+            self.retrieve(corpusPath=corpusPath)
+
+    def test_empty_corpus_is_rejected_by_timestamp_format_check(self):
+        corpusPath = newsFixtures.createCorpusFixture(self.folder / 'emptyFormat.db')
+        with sqlite3.connect(corpusPath) as connection:
+            connection.execute('DELETE FROM messages')
+        with self.assertRaisesRegex(NewsContextError, r'messages\.date — корпус пуст \(0 строк\)'):
+            self.retrieve(corpusPath=corpusPath)
+
+    def test_naive_timestamp_is_rejected_instead_of_falling_back_to_the_machine_zone(self):
+        with self.assertRaisesRegex(NewsContextError, '2022-03-24T23:59:00.*UTC'):
+            moscowDate('2022-03-24T23:59:00')
+
+    def test_moscow_date_of_an_aware_timestamp_is_unchanged(self):
+        self.assertEqual(date(2022, 3, 24), moscowDate('2022-03-24T20:59:00+00:00'))
+        self.assertEqual(date(2022, 3, 25), moscowDate('2022-03-24T21:00:00+00:00'))
+        self.assertEqual(date(2022, 3, 25), moscowDate('2022-03-24T23:59:00+00:00'))
 
 
 class TestNewsRetrievalCutoff(NewsFixtureTestCase):
@@ -431,25 +502,6 @@ class TestNewsRagConfigurationValidation(TestCase):
     работы, поэтому проверка на входе — единственное дешёвое место.
     """
 
-    def test_zero_attempts_is_rejected(self):
-        with self.assertRaises(ValueError):
-            NewsRagConfiguration(summarizeAttempts=0)
-
-    def test_negative_attempts_is_rejected(self):
-        with self.assertRaises(ValueError):
-            NewsRagConfiguration(summarizeAttempts=-1)
-
-    def test_single_attempt_is_allowed(self):
-        # Одна попытка — это «без повторов», законная настройка.
-        self.assertEqual(1, NewsRagConfiguration(summarizeAttempts=1).summarizeAttempts)
-
-    def test_negative_retry_delay_is_rejected(self):
-        with self.assertRaises(ValueError):
-            NewsRagConfiguration(summarizeRetryDelaySeconds=-1)
-
-    def test_zero_retry_delay_is_allowed(self):
-        self.assertEqual(0, NewsRagConfiguration(summarizeRetryDelaySeconds=0).summarizeRetryDelaySeconds)
-
     def test_non_positive_horizon_is_rejected(self):
         with self.assertRaises(ValueError):
             NewsRagConfiguration(horizonDays=0)
@@ -485,7 +537,8 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         first = provider.prepare(runDate)
         second = provider.prepare(runDate)
 
-        self.assertEqual(1, summarizer.calls)
+        self.assertEqual(1, len(summarizer.axisInputs))
+        self.assertEqual(1, len(summarizer.metaInputs))
         self.assertIs(first, second)
         self.assertEqual('первое саммари', first.summary)
         self.assertFalse(first.summaryFromCache)
@@ -625,78 +678,180 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         )
         self.assertIsNone(artefact['failed_axes'])
 
-    def test_transient_summarization_failure_is_retried(self):
-        configuration = self.createConfiguration(
-            mode=twoStageMode, projectDbPath=self.cachePath, summarizeModel='test/model',
-            summarizeAttempts=3, summarizeRetryDelaySeconds=0,
+    def test_axis_summaries_are_saved_before_the_meta_call(self):
+        cache = NewsSummariesCache(self.cachePath)
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        storedAtMeta = {}
+
+        class InspectingSummarizer(StubSummarizer):
+            async def buildMetaSummary(self, axisSummaries):
+                storedAtMeta.update(
+                    cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model')
+                )
+                return await super().buildMetaSummary(axisSummaries)
+
+        summarizer = InspectingSummarizer()
+        NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
+
+        self.assertEqual(
+            {axis: f'саммари оси {axis}' for axis in self.configuration.axes}, storedAtMeta
         )
-        summarizer = FlakySummarizer(failuresBeforeSuccess=2)
+
+    def test_axis_summaries_survive_a_failing_meta_call(self):
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        cache = NewsSummariesCache(self.cachePath)
+        summarizer = StubSummarizer()
+        summarizer.metaError = MetaSummaryError(
+            axis_summaries={}, failed_axes=[], axis_errors={}, usage=Usage()
+        )
+        provider = NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer)
+
+        with self.assertRaises(MetaSummaryError) as raised:
+            provider.prepare(runDate)
+
+        self.assertIs(summarizer.metaError, raised.exception)
+        self.assertEqual(1, len(summarizer.axisInputs))
+        self.assertEqual(1, len(summarizer.metaInputs))
+        self.assertEqual(
+            {axis: f'саммари оси {axis}' for axis in self.configuration.axes},
+            cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model'),
+        )
+        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model'))
+
+        recovered = StubSummarizer()
+        context = NewsContextProvider(
+            self.configuration, SilentLogger(), summarizer=recovered
+        ).prepare(runDate)
+        self.assertEqual([], recovered.axisInputs)
+        self.assertEqual(1, len(recovered.metaInputs))
+        self.assertEqual(recovered.meta, context.summary)
+
+    def test_cached_axes_are_merged_with_recomputed_ones_in_the_configured_order(self):
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        secondAxis = list(self.configuration.axes)[1]
+        NewsSummariesCache(self.cachePath).saveAxisSummaries(
+            runDate, newsFixtures.horizonDays, 'test/model',
+            {secondAxis: 'из кеша'}, {secondAxis: 1},
+        )
+        summarizer = StubSummarizer()
+        NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
+
+        self.assertEqual(1, len(summarizer.metaInputs))
+        self.assertEqual(list(self.configuration.axes), list(summarizer.metaInputs[0]))
+        self.assertEqual('из кеша', summarizer.metaInputs[0][secondAxis])
+        self.assertEqual(
+            f'саммари оси {newsFixtures.firstAxis}',
+            summarizer.metaInputs[0][newsFixtures.firstAxis],
+        )
+
+    def test_only_missing_axes_are_recomputed(self):
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        cache = NewsSummariesCache(self.cachePath)
+        secondAxis = list(self.configuration.axes)[1]
+        cache.saveAxisSummaries(
+            runDate, newsFixtures.horizonDays, 'test/model',
+            {secondAxis: 'из кеша'}, {secondAxis: 1},
+        )
+        summarizer = StubSummarizer()
+        provider = NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer)
+        retrieved = provider.retriever.retrieve(runDate)
+        provider.prepare(runDate)
+        self.assertEqual(
+            [{axis: documents for axis, documents in retrieved.items() if axis != secondAxis}],
+            summarizer.axisInputs,
+        )
+
+        # Отдельная дата с полным кешем осей, но без готовой меты.
+        otherDate = date(2022, 3, 26)
+        cached = {axis: f'кеш {axis}' for axis in retrieved}
+        cache.saveAxisSummaries(
+            otherDate, newsFixtures.horizonDays, 'test/model',
+            cached, {axis: len(documents) for axis, documents in retrieved.items()},
+        )
+        allCached = StubSummarizer()
+        logger = SilentLogger()
+        provider = NewsContextProvider(self.configuration, logger, summarizer=allCached)
+        context = provider.prepare(otherDate)
+        self.assertEqual([], allCached.axisInputs)
+        self.assertEqual([cached], allCached.metaInputs)
+        self.assertEqual(
+            (allCached.meta, (), False),
+            (context.summary, context.failedAxes, context.summaryFromCache),
+        )
+        self.assertIn(
+            f'News summary for {otherDate} computed: {len(allCached.meta)} characters, '
+            '1 provider calls, 37 tokens',
+            logger.messages,
+        )
+
+    def test_failed_axis_placeholder_still_reaches_the_meta_prompt(self):
+        summarizer = StubSummarizer(failedAxes=(newsFixtures.firstAxis,))
+        NewsContextProvider(
+            self.configuration, SilentLogger(), summarizer=summarizer
+        ).prepare(date.fromisoformat(newsFixtures.runDate))
+
+        self.assertEqual(1, len(summarizer.metaInputs))
+        self.assertEqual(list(self.configuration.axes), list(summarizer.metaInputs[0]))
+        self.assertEqual(failedAxisPlaceholder, summarizer.metaInputs[0][newsFixtures.firstAxis])
+
+    def test_computed_axes_are_saved_when_too_many_axes_fail(self):
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        axes = list(self.configuration.axes)
+        computed = {axes[0]: 'успешная ось'}
+        summarizer = StubSummarizer()
+        summarizer.axisError = TooManyAxisFailures(
+            {axis: 'ошибка' for axis in axes[1:]},
+            axis_summaries=computed, usage=Usage(calls=3, total_tokens=123),
+        )
+        provider = NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer)
+
+        with self.assertRaises(TooManyAxisFailures) as raised:
+            provider.prepare(runDate)
+
+        self.assertIs(summarizer.axisError, raised.exception)
+        self.assertEqual(1, len(summarizer.axisInputs))
+        self.assertEqual([], summarizer.metaInputs)
+        cache = NewsSummariesCache(self.cachePath)
+        self.assertEqual(computed, cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model'))
+        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model'))
+
+        recovered = StubSummarizer()
+        NewsContextProvider(self.configuration, SilentLogger(), summarizer=recovered).prepare(runDate)
+        self.assertEqual(1, len(recovered.axisInputs))
+        self.assertEqual(axes[1:], list(recovered.axisInputs[0]))
+        self.assertEqual(1, len(recovered.metaInputs))
+        self.assertEqual(axes, list(recovered.metaInputs[0]))
+        self.assertEqual(computed[axes[0]], recovered.metaInputs[0][axes[0]])
+
+    def test_usage_of_both_stages_is_summed(self):
+        summarizer = StubSummarizer()
+        summarizer.axisUsage = Usage(calls=7, total_tokens=123)
+        summarizer.metaUsage = Usage(calls=2, total_tokens=45)
+        logger = SilentLogger()
+        NewsContextProvider(self.configuration, logger, summarizer=summarizer).prepare(date.fromisoformat(newsFixtures.runDate))
+
+        self.assertIn(
+            f'News summary for {newsFixtures.runDate} computed: {len(summarizer.meta)} characters, '
+            '9 provider calls, 168 tokens',
+            logger.messages,
+        )
+
+    def test_failed_date_does_not_land_in_the_summary_cache(self):
+        summarizer = StubSummarizer()
+        summarizer.metaError = MetaSummaryError(
+            axis_summaries={}, failed_axes=[], axis_errors={}, usage=Usage()
+        )
+        provider = NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer)
         runDate = date.fromisoformat(newsFixtures.runDate)
 
-        context = NewsContextProvider(configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
+        with self.assertRaises(MetaSummaryError):
+            provider.prepare(runDate)
 
-        self.assertEqual(3, summarizer.calls)
-        self.assertEqual('саммари со второй попытки', context.summary)
-
-    def test_too_many_axis_failures_is_retried_as_well(self):
-        # TooManyAxisFailures — подкласс SummarizeError и такой же временный сбой
-        # провайдера, как пустой ответ: 2026-09-06 все девять осей отвалились
-        # разом по 403 и вернулись через минуту.
-        configuration = self.createConfiguration(
-            mode=twoStageMode, projectDbPath=self.cachePath, summarizeModel='test/model',
-            summarizeAttempts=2, summarizeRetryDelaySeconds=0,
-        )
-        summarizer = FlakySummarizer(failuresBeforeSuccess=1,
-                                     error=TooManyAxisFailures({'дкп': 'PermissionDeniedError(403)'}))
-        runDate = date.fromisoformat(newsFixtures.runDate)
-
-        NewsContextProvider(configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
-
-        self.assertEqual(2, summarizer.calls)
-
-    def test_summarization_failure_is_raised_after_the_last_attempt(self):
-        configuration = self.createConfiguration(
-            mode=twoStageMode, projectDbPath=self.cachePath, summarizeModel='test/model',
-            summarizeAttempts=2, summarizeRetryDelaySeconds=0,
-        )
-        summarizer = FlakySummarizer(failuresBeforeSuccess=99)
-        runDate = date.fromisoformat(newsFixtures.runDate)
-
-        with self.assertRaises(SummarizeError):
-            NewsContextProvider(configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
-
-        self.assertEqual(2, summarizer.calls)
+        self.assertEqual(1, len(summarizer.metaInputs))
         self.assertIsNone(
             NewsSummariesCache(self.cachePath).getSummary(runDate, newsFixtures.horizonDays, 'test/model'),
             'Провалившаяся дата не должна попадать в кеш',
         )
-
-    def test_non_summarization_errors_are_not_retried(self):
-        # Ошибка конфигурации или шаблона повтором не лечится: она наша, а не
-        # провайдера, и повторы её только прячут.
-        configuration = self.createConfiguration(
-            mode=twoStageMode, projectDbPath=self.cachePath, summarizeModel='test/model',
-            summarizeAttempts=5, summarizeRetryDelaySeconds=0,
-        )
-        summarizer = FlakySummarizer(failuresBeforeSuccess=99, error=ConfigurationError('axes cannot be empty'))
-        runDate = date.fromisoformat(newsFixtures.runDate)
-
-        with self.assertRaises(ConfigurationError):
-            NewsContextProvider(configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
-
-        self.assertEqual(1, summarizer.calls, 'Повтор не должен применяться к ошибкам не от провайдера')
-
-    def test_successful_summarization_is_not_retried(self):
-        configuration = self.createConfiguration(
-            mode=twoStageMode, projectDbPath=self.cachePath, summarizeModel='test/model',
-            summarizeAttempts=3, summarizeRetryDelaySeconds=0,
-        )
-        summarizer = StubSummarizer('с первого раза')
-        runDate = date.fromisoformat(newsFixtures.runDate)
-
-        NewsContextProvider(configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
-
-        self.assertEqual(1, summarizer.calls)
 
     def test_axis_summaries_are_stored_for_every_successful_axis(self):
         provider = NewsContextProvider(self.configuration, SilentLogger(),
@@ -726,6 +881,11 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         self.assertNotIn(failedAxis, stored)
         self.assertNotIn(failedAxisPlaceholder, stored.values())
         self.assertEqual(len(self.configuration.axes) - 1, len(stored))
+        summary = NewsSummariesCache(self.cachePath).getSummary(
+            runDate, newsFixtures.horizonDays, 'test/model'
+        )
+        self.assertEqual(('мета', sum(len(docs) for docs in provider.getContext(runDate).documents.values()),
+                          (failedAxis,)), summary)
 
     def test_axis_summaries_of_another_horizon_or_model_are_not_returned(self):
         cache = NewsSummariesCache(self.cachePath)
