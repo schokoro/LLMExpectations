@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import date
 
+from amnesiac.exceptions import SummarizeError
 from amnesiac.summarize import TooManyAxisFailures, Usage
 
 from Logging.BaseLogger import BaseLogger
@@ -40,6 +41,8 @@ class NewsContextProvider:
                                else NewsSummariesCache(configuration.projectDbPath))
 
         self.contexts: dict[date, NewsContext] = {}
+        self.usageByDate: dict[date, Usage] = {}
+        self.usageCompleteByDate: dict[date, bool] = {}
 
     def prepare(self, surveyDate) -> NewsContext:
         """Посчитать контекст на дату. Идемпотентно в пределах прогона."""
@@ -48,6 +51,8 @@ class NewsContextProvider:
         if runDate in self.contexts:
             return self.contexts[runDate]
 
+        self.usageByDate.setdefault(runDate, Usage())
+        self.usageCompleteByDate.setdefault(runDate, True)
         retrieved = self.retriever.retrieve(runDate)
         windowFrom, windowToExclusive = self.retriever.getWindow(runDate)
 
@@ -97,10 +102,12 @@ class NewsContextProvider:
         runDate: date,
         retrieved: dict,
     ) -> tuple[str, tuple[str, ...] | None, bool]:
+        configHash = self.configuration.configHash()
         cached = self.summariesCache.getSummary(
             runDate,
             self.configuration.horizonDays,
             self.configuration.summarizeModel,
+            configHash,
         )
 
         if cached is not None:
@@ -131,7 +138,7 @@ class NewsContextProvider:
         horizonDays = self.configuration.horizonDays
         model = self.configuration.summarizeModel
         documentCounts = {axis: len(documents) for axis, documents in retrieved.items()}
-        cachedAxes = self.summariesCache.getAxisSummaries(runDate, horizonDays, model)
+        cachedAxes = self.summariesCache.getAxisSummaries(runDate, horizonDays, model, configHash)
         missing = {
             axis: documents for axis, documents in retrieved.items() if axis not in cachedAxes
         }
@@ -139,11 +146,19 @@ class NewsContextProvider:
         if missing:
             try:
                 axesResult = asyncio.run(self.summarizer.buildAxisSummaries(missing))
-            except TooManyAxisFailures as error:
-                self.summariesCache.saveAxisSummaries(
-                    runDate, horizonDays, model, error.axis_summaries, documentCounts
-                )
+            except SummarizeError as error:
+                self._recordFailedUsage(runDate, error)
+                if isinstance(error, TooManyAxisFailures):
+                    self.summariesCache.saveAxisSummaries(
+                        runDate, horizonDays, model, error.axis_summaries, documentCounts, configHash
+                    )
                 raise
+            except BaseException:
+                # Транспортный отказ не возвращает usage незавершённой стадии.
+                self.usageCompleteByDate[runDate] = False
+                raise
+
+            self.usageByDate[runDate] += axesResult.usage
 
             failed = set(axesResult.failed_axes)
             self.summariesCache.saveAxisSummaries(
@@ -156,6 +171,7 @@ class NewsContextProvider:
                     if axis not in failed
                 },
                 documentCounts,
+                configHash,
             )
             ready = cachedAxes | axesResult.axis_summaries
             failedAxes = tuple(axesResult.failed_axes)
@@ -165,7 +181,15 @@ class NewsContextProvider:
 
         # Порядок осей — часть входа мета-промпта, в том числе при досчёте хвоста.
         merged = {axis: ready[axis] for axis in retrieved}
-        metaResult = asyncio.run(self.summarizer.buildMetaSummary(merged))
+        try:
+            metaResult = asyncio.run(self.summarizer.buildMetaSummary(merged))
+        except SummarizeError as error:
+            self._recordFailedUsage(runDate, error)
+            raise
+        except BaseException:
+            self.usageCompleteByDate[runDate] = False
+            raise
+        self.usageByDate[runDate] += metaResult.usage
         usage = usage + metaResult.usage
 
         self.summariesCache.saveSummary(
@@ -175,6 +199,7 @@ class NewsContextProvider:
             sum(documentCounts.values()),
             model,
             failedAxes,
+            configHash,
         )
 
         self.logger.logDebug(
@@ -183,6 +208,13 @@ class NewsContextProvider:
         )
 
         return metaResult.meta, failedAxes, False
+
+    def _recordFailedUsage(self, runDate: date, error: SummarizeError) -> None:
+        usage = getattr(error, 'usage', None)
+        if usage is None:
+            self.usageCompleteByDate[runDate] = False
+        else:
+            self.usageByDate[runDate] += usage
 
     @staticmethod
     def _hasRunningEventLoop() -> bool:

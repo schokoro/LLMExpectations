@@ -7,13 +7,14 @@ from amnesiac.summarize import (
     summarize_meta,
 )
 from amnesiac.summarize.prompts import RU_MACRO_V1
-from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
 
 from Logging.BaseLogger import BaseLogger
 from NewsLogic.NewsDocument import NewsDocument
 from NewsLogic.newsExceptions import NewsContextError
 from NewsLogic.newsHelpers import readSecret
 from NewsLogic.NewsRagConfiguration import NewsRagConfiguration
+from NewsLogic.PinnedOpenRouterClient import PinnedOpenRouterClient
 
 
 class NewsSummarizer:
@@ -28,14 +29,20 @@ class NewsSummarizer:
         self.configuration = configuration
         self.logger = logger
 
+    async def preflight(self) -> ChatCompletion:
+        """Один короткий запрос через ту же фабрику и пин, что у суммаризации."""
+        client = self._createClient(maxRetries=0)
+        return await client.chat.completions.create(
+            model=self.configuration.summarizeModel,
+            messages=[{'role': 'user', 'content': 'Ответь: OK'}],
+            temperature=self.configuration.summarizeTemperature,
+            max_tokens=1,
+        )
+
     async def buildAxisSummaries(
         self, retrieved: dict[str, list[NewsDocument]]
     ) -> AxisSummariesResult:
-        client = AsyncOpenAI(
-            base_url=self.configuration.summarizeBaseUrl,
-            api_key=self._getApiKey(),
-            timeout=self.configuration.summarizeTimeout,
-        )
+        client = self._createClient()
 
         axes = {
             axis: [
@@ -76,11 +83,7 @@ class NewsSummarizer:
         return result
 
     async def buildMetaSummary(self, axisSummaries: dict[str, str]) -> MetaResult:
-        client = AsyncOpenAI(
-            base_url=self.configuration.summarizeBaseUrl,
-            api_key=self._getApiKey(),
-            timeout=self.configuration.summarizeTimeout,
-        )
+        client = self._createClient()
 
         return await summarize_meta(
             client=client,
@@ -92,6 +95,15 @@ class NewsSummarizer:
                 concurrency=self.configuration.summarizeConcurrency,
                 max_failed_axes=self.configuration.summarizeMaxFailedAxes,
             ),
+        )
+
+    def _createClient(self, maxRetries: int = 2) -> PinnedOpenRouterClient:
+        return PinnedOpenRouterClient(
+            provider=self.configuration.summarizeProvider,
+            base_url=self.configuration.summarizeBaseUrl,
+            api_key=self._getApiKey(),
+            timeout=self.configuration.summarizeTimeout,
+            max_retries=maxRetries,
         )
 
     def _getApiKey(self) -> str:

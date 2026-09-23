@@ -208,15 +208,20 @@ def createCorpusFixture(path: Path, withForeignTimestamp: bool | str = False) ->
     return path
 
 
-def createProjectDbFixture(path: Path, withFailedAxes: bool = True, withAxisSummaries: bool = True) -> Path:
+def createProjectDbFixture(
+    path: Path, withFailedAxes: bool = True, withAxisSummaries: bool = True,
+    withConfigHash: bool = True,
+) -> Path:
     """Проектная база с переносимым ядром схемы (data/newsDB/SCHEMA.md).
 
     `withFailedAxes=False` даёт схему до миграции 012, `withAxisSummaries=False`
     — до 013. Обе нужны, чтобы проверить, что кеш замечает недостающую схему и
     говорит об этом, а не падает на SQL или, того хуже, молча теряет данные.
     """
+    # withConfigHash=False оставляет схему без миграции 015.
+    configHashColumn = ',\n            config_hash   TEXT' if withConfigHash else ''
     failedAxesColumn = ',\n            failed_axes   TEXT' if withFailedAxes else ''
-    axisSummariesTable = """
+    axisSummariesTable = f"""
         CREATE TABLE axis_summaries (
             run_date      TEXT NOT NULL,
             axis          TEXT NOT NULL,
@@ -224,7 +229,7 @@ def createProjectDbFixture(path: Path, withFailedAxes: bool = True, withAxisSumm
             model         TEXT,
             summary       TEXT NOT NULL,
             doc_count     INTEGER,
-            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP{configHashColumn},
             PRIMARY KEY (run_date, axis)
         );
     """ if withAxisSummaries else ''
@@ -239,7 +244,7 @@ def createProjectDbFixture(path: Path, withFailedAxes: bool = True, withAxisSumm
             summary       TEXT NOT NULL,
             doc_count     INTEGER,
             model         TEXT,
-            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP{failedAxesColumn}
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP{failedAxesColumn}{configHashColumn}
         );
         {axisSummariesTable}
         """

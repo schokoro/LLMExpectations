@@ -2,24 +2,33 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
-from datetime import date, datetime
+from argparse import Namespace
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from amnesiac.exceptions import ConfigurationError, PromptRenderError, SummarizeError
 from amnesiac.summarize import (
     AxisSummariesResult,
     MetaResult,
     MetaSummaryError,
+    SummarizeConfig,
     TooManyAxisFailures,
     Usage,
 )
+from amnesiac.summarize.prompts import RU_MACRO_V1
 
 from Logging.BaseLogger import BaseLogger
+from NewsLogic import NewsRagConfiguration as newsRagConfiguration
 from NewsLogic.NewsContext import NewsContext
 from NewsLogic.NewsContextProvider import NewsContextProvider
-from NewsLogic.NewsCorpusReader import NewsCorpusReader
+from NewsLogic.NewsCorpusReader import NewsCorpusReader, queryListHash
 from NewsLogic.NewsDocument import NewsDocument
 from NewsLogic.newsExceptions import (
     NewsContextError,
@@ -27,10 +36,23 @@ from NewsLogic.newsExceptions import (
     NewsContextUnavailableError,
 )
 from NewsLogic.newsHelpers import moscowDate, readSecret
-from NewsLogic.NewsRagConfiguration import NewsRagConfiguration, rawMode, twoStageMode
+from NewsLogic.NewsRagConfiguration import (
+    NewsRagConfiguration,
+    defaultAxes,
+    defaultAxisOrder,
+    rawMode,
+    twoStageMode,
+)
 from NewsLogic.NewsRetriever import NewsRetriever
 from NewsLogic.newsSectionRenderer import renderNewsSection
 from NewsLogic.NewsSummariesCache import NewsSummariesCache
+from NewsLogic.NewsSummarizer import NewsSummarizer
+from NewsLogic.RunManifest import RunManifest, readCodeEnvironment, readRespondentData
+from runMySeriesWithNews import (
+    SummarizationCircuitBreakerError,
+    prepareContexts,
+    runPreflight,
+)
 from SurveyLogic.PromptBuilders.ContextPromptBuilders.NewsPromptBuilder import (
     NewsPromptBuilder,
 )
@@ -519,6 +541,263 @@ class TestNewsRagConfigurationValidation(TestCase):
             NewsRagConfiguration(mode='summarized')
 
 
+class TestNewsConfigurationHash(TestCase):
+    def test_default_axis_order_is_the_exact_agreed_sequence(self):
+        expected = [
+            'дкп',
+            'инфляция',
+            'продовольствие',
+            'курс',
+            'тарифы',
+            'зарплаты',
+            'труд',
+            'кризис',
+            'бюджет',
+        ]
+        self.assertIsInstance(defaultAxisOrder, tuple)
+        self.assertEqual(expected, list(defaultAxisOrder))
+        self.assertEqual(expected, list(defaultAxes))
+        self.assertEqual(expected, list(NewsRagConfiguration().axes))
+
+    def test_hash_changes_with_axis_order(self):
+        configuration = NewsRagConfiguration()
+        axes = dict(reversed(list(configuration.axes.items())))
+        self.assertNotEqual(
+            configuration.configHash(), replace(configuration, axes=axes).configHash()
+        )
+
+    def test_hash_changes_with_axis_query_texts(self):
+        configuration = NewsRagConfiguration()
+        axes = {axis: list(queries) for axis, queries in configuration.axes.items()}
+        axes['дкп'][0] += ' изменённый запрос'
+        self.assertNotEqual(
+            configuration.configHash(), replace(configuration, axes=axes).configHash()
+        )
+
+    def test_hash_ignores_dictionary_construction_history_with_the_same_axis_order(self):
+        configuration = NewsRagConfiguration()
+        reversedAxes = dict(reversed(list(configuration.axes.items())))
+        axes = {axis: reversedAxes[axis] for axis in defaultAxisOrder}
+        self.assertEqual(configuration.configHash(), replace(configuration, axes=axes).configHash())
+
+    def test_hash_serialization_is_canonical_across_payload_key_order_and_formatting(self):
+        configuration = NewsRagConfiguration()
+        dumps = json.dumps
+        with patch.object(newsRagConfiguration.json, 'dumps', wraps=dumps) as serialize:
+            actual = configuration.configHash()
+        payload = serialize.call_args.args[0]
+        reordered = dict(reversed(list(payload.items())))
+        reordered['summarizePromptPack'] = dict(
+            reversed(list(reordered['summarizePromptPack'].items()))
+        )
+        reformatted = json.loads(dumps(reordered, indent=4, ensure_ascii=True))
+        canonical = dumps(reformatted, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+        self.assertEqual(sha256(canonical.encode('utf-8')).hexdigest(), actual)
+        self.assertEqual(
+            [[axis, list(queries)] for axis, queries in configuration.axes.items()], payload['axes']
+        )
+        self.assertEqual(RU_MACRO_V1.model_dump(exclude={'params'}), payload['summarizePromptPack'])
+
+    def test_hash_changes_with_topKPerAxis(self):
+        configuration = NewsRagConfiguration()
+        self.assertNotEqual(
+            configuration.configHash(), replace(configuration, topKPerAxis=51).configHash()
+        )
+
+    def test_hash_changes_with_dedupThreshold(self):
+        configuration = NewsRagConfiguration()
+        self.assertNotEqual(
+            configuration.configHash(), replace(configuration, dedupThreshold=0.8).configHash()
+        )
+
+    def test_hash_changes_with_excludeChannels(self):
+        configuration = NewsRagConfiguration()
+        self.assertNotEqual(
+            configuration.configHash(),
+            replace(configuration, excludeChannels=('other',)).configHash(),
+        )
+
+    def test_hash_changes_with_mode(self):
+        configuration = NewsRagConfiguration()
+        self.assertNotEqual(
+            configuration.configHash(), replace(configuration, mode=rawMode).configHash()
+        )
+
+    def test_hash_changes_with_summarizeTemperature(self):
+        configuration = NewsRagConfiguration()
+        self.assertNotEqual(
+            configuration.configHash(),
+            replace(configuration, summarizeTemperature=0.5).configHash(),
+        )
+
+    def test_hash_changes_with_summarizeMaxFailedAxes(self):
+        configuration = NewsRagConfiguration()
+        self.assertNotEqual(
+            configuration.configHash(),
+            replace(configuration, summarizeMaxFailedAxes=1).configHash(),
+        )
+
+    def test_hash_changes_with_summarizeBaseUrl(self):
+        configuration = NewsRagConfiguration()
+        self.assertNotEqual(
+            configuration.configHash(),
+            replace(configuration, summarizeBaseUrl='https://example.invalid/v1').configHash(),
+        )
+
+    def test_hash_changes_with_summarizeProvider(self):
+        configuration = NewsRagConfiguration()
+        self.assertNotEqual(
+            configuration.configHash(),
+            replace(configuration, summarizeProvider='other/fp8').configHash(),
+        )
+
+    def test_hash_changes_with_windowRule(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        with patch.object(newsRagConfiguration, 'windowRule', 'different_window_rule'):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_moscowUtcOffsetHours(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        with patch.object(newsRagConfiguration, 'moscowUtcOffsetHours', 4):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_name(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(update={'name': RU_MACRO_V1.name + ' изменение'})
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_axis_system(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(
+            update={'axis_system': RU_MACRO_V1.axis_system + ' изменение'}
+        )
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_axis_user(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(update={'axis_user': RU_MACRO_V1.axis_user + ' изменение'})
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_meta_system(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(
+            update={'meta_system': RU_MACRO_V1.meta_system + ' изменение'}
+        )
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_meta_user(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(update={'meta_user': RU_MACRO_V1.meta_user + ' изменение'})
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_doc_template(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(
+            update={'doc_template': RU_MACRO_V1.doc_template + ' изменение'}
+        )
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_doc_separator(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(
+            update={'doc_separator': RU_MACRO_V1.doc_separator + ' изменение'}
+        )
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_axis_block_template(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(
+            update={'axis_block_template': RU_MACRO_V1.axis_block_template + ' изменение'}
+        )
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_changes_with_prompt_pack_axis_block_separator(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        changed = RU_MACRO_V1.model_copy(
+            update={'axis_block_separator': RU_MACRO_V1.axis_block_separator + ' изменение'}
+        )
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', changed):
+            self.assertNotEqual(original, configuration.configHash())
+
+    def test_hash_ignores_horizonDays(self):
+        configuration = NewsRagConfiguration()
+        self.assertEqual(
+            configuration.configHash(), replace(configuration, horizonDays=7).configHash()
+        )
+
+    def test_hash_ignores_summarizeModel(self):
+        configuration = NewsRagConfiguration()
+        self.assertEqual(
+            configuration.configHash(),
+            replace(configuration, summarizeModel='other/model').configHash(),
+        )
+
+    def test_hash_ignores_summarizeConcurrency(self):
+        configuration = NewsRagConfiguration()
+        self.assertEqual(
+            configuration.configHash(), replace(configuration, summarizeConcurrency=2).configHash()
+        )
+
+    def test_hash_ignores_summarizeTimeout(self):
+        configuration = NewsRagConfiguration()
+        self.assertEqual(
+            configuration.configHash(), replace(configuration, summarizeTimeout=123.0).configHash()
+        )
+
+    def test_hash_ignores_summarizeApiKeyVariable(self):
+        configuration = NewsRagConfiguration()
+        self.assertEqual(
+            configuration.configHash(),
+            replace(configuration, summarizeApiKeyVariable='OTHER_KEY').configHash(),
+        )
+
+    def test_hash_ignores_corpusPath(self):
+        configuration = NewsRagConfiguration()
+        self.assertEqual(
+            configuration.configHash(),
+            replace(configuration, corpusPath=Path('otherCorpus.db')).configHash(),
+        )
+
+    def test_hash_ignores_projectDbPath(self):
+        configuration = NewsRagConfiguration()
+        self.assertEqual(
+            configuration.configHash(),
+            replace(configuration, projectDbPath=Path('otherProject.db')).configHash(),
+        )
+
+    def test_hash_ignores_artefactsFolder(self):
+        configuration = NewsRagConfiguration()
+        self.assertEqual(
+            configuration.configHash(),
+            replace(configuration, artefactsFolder=Path('otherArtefacts')).configHash(),
+        )
+
+    def test_hash_ignores_prompt_pack_bound_params(self):
+        configuration = NewsRagConfiguration()
+        original = configuration.configHash()
+        with patch.object(newsRagConfiguration, 'RU_MACRO_V1', RU_MACRO_V1.bind(horizon_days=99)):
+            self.assertEqual(original, configuration.configHash())
+
+
 class TestNewsSummaryCaching(NewsFixtureTestCase):
     def setUp(self):
         self.cachePath = self.folder / f'cache_{self.id()}.db'
@@ -547,7 +826,9 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         summarizer = StubSummarizer('сохранённое саммари')
         runDate = date.fromisoformat(newsFixtures.runDate)
 
-        NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
+        NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer).prepare(
+            runDate
+        )
 
         context = NewsContextProvider(
             self.configuration,
@@ -558,27 +839,119 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         self.assertEqual('сохранённое саммари', context.summary)
         self.assertTrue(context.summaryFromCache)
 
+    def test_cached_summary_of_another_config_hash_is_ignored(self):
+        cache = NewsSummariesCache(self.cachePath)
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        cache.saveSummary(runDate, newsFixtures.horizonDays, 'старое', 10, 'test/model', (), 'old')
+        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model', 'new'))
+        summarizer = StubSummarizer()
+        context = NewsContextProvider(
+            self.configuration, SilentLogger(), summarizer=summarizer
+        ).prepare(runDate)
+        self.assertFalse(context.summaryFromCache)
+        self.assertEqual(summarizer.meta, context.summary)
+
+    def test_axis_summaries_of_another_config_hash_are_not_returned(self):
+        cache = NewsSummariesCache(self.cachePath)
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        cached = {axis: 'старое' for axis in self.configuration.axes}
+        cache.saveAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model', cached, {}, 'old')
+        self.assertEqual(
+            {}, cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model', 'new')
+        )
+        summarizer = StubSummarizer()
+        NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer).prepare(
+            runDate
+        )
+        self.assertEqual(list(self.configuration.axes), list(summarizer.axisInputs[0]))
+
+    def test_both_cache_tables_round_trip_with_the_same_config_hash(self):
+        cache = NewsSummariesCache(self.cachePath)
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        configHash = self.configuration.configHash()
+        cache.saveSummary(
+            runDate, newsFixtures.horizonDays, 'мета', 10, 'test/model', ('курс',), configHash
+        )
+        cache.saveAxisSummaries(
+            runDate, newsFixtures.horizonDays, 'test/model', {'дкп': 'ось'}, {'дкп': 4}, configHash
+        )
+        self.assertEqual(
+            ('мета', 10, ('курс',)),
+            cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash),
+        )
+        self.assertEqual(
+            {'дкп': 'ось'},
+            cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model', configHash),
+        )
+        with sqlite3.connect(self.cachePath) as connection:
+            for table in ('summaries', 'axis_summaries'):
+                self.assertEqual(
+                    (configHash,), connection.execute(f'SELECT config_hash FROM {table}').fetchone()
+                )
+
+    def test_migration_015_adds_nullable_hash_columns_to_both_tables(self):
+        path = self.folder / 'apply015.db'
+        newsFixtures.createProjectDbFixture(path, withConfigHash=False)
+        migration = Path('../data/newsDB/migrations/015_summaries_config_hash.sql').read_text()
+        with sqlite3.connect(path) as connection:
+            connection.executescript(migration)
+            for table in ('summaries', 'axis_summaries'):
+                columns = {row[1]: row for row in connection.execute(f'PRAGMA table_info({table})')}
+                self.assertEqual(('TEXT', 0, None), columns['config_hash'][2:5])
+            with self.assertRaisesRegex(sqlite3.OperationalError, 'duplicate column'):
+                connection.executescript(migration)
+
+    def test_null_config_hash_is_a_miss_in_both_tables(self):
+        cache = NewsSummariesCache(self.cachePath)
+        runDate = date.fromisoformat(newsFixtures.runDate)
+        configHash = self.configuration.configHash()
+        cache.saveSummary(runDate, newsFixtures.horizonDays, 'мета', 1, 'test/model', (), configHash)
+        cache.saveAxisSummaries(
+            runDate, newsFixtures.horizonDays, 'test/model', {'дкп': 'ось'}, {}, configHash
+        )
+        with sqlite3.connect(self.cachePath) as connection:
+            connection.execute('UPDATE summaries SET config_hash = NULL')
+            connection.execute('UPDATE axis_summaries SET config_hash = NULL')
+        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash))
+        self.assertEqual({}, cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model', configHash))
+
+    def test_database_without_015_is_reported_instead_of_being_used(self):
+        path = self.folder / 'without015.db'
+        newsFixtures.createProjectDbFixture(path, withConfigHash=False)
+        with self.assertRaisesRegex(NewsContextError, '015_summaries_config_hash.sql'):
+            NewsSummariesCache(path).getSummary(date(2022, 3, 25), 14, 'test/model', 'hash')
+
+    def test_database_without_axis_config_hash_is_reported(self):
+        path = self.folder / 'withoutAxis015.db'
+        newsFixtures.createProjectDbFixture(path, withConfigHash=False)
+        with sqlite3.connect(path) as connection:
+            connection.execute('ALTER TABLE summaries ADD COLUMN config_hash TEXT')
+        with self.assertRaisesRegex(
+            NewsContextError, 'axis_summaries.*015_summaries_config_hash.sql'
+        ):
+            NewsSummariesCache(path).getAxisSummaries(date(2022, 3, 25), 14, 'test/model', 'hash')
+
     def test_cached_summary_of_another_horizon_is_ignored(self):
         cache = NewsSummariesCache(self.cachePath)
         runDate = date.fromisoformat(newsFixtures.runDate)
-        cache.saveSummary(runDate, newsFixtures.horizonDays + 1, 'чужой горизонт', 10, 'test/model', ())
+        cache.saveSummary(runDate, newsFixtures.horizonDays + 1, 'чужой горизонт', 10, 'test/model', (), configHash=self.configuration.configHash())
 
-        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model'))
+        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()))
 
     def test_cached_summary_of_another_model_is_ignored(self):
         cache = NewsSummariesCache(self.cachePath)
         runDate = date.fromisoformat(newsFixtures.runDate)
-        cache.saveSummary(runDate, newsFixtures.horizonDays, 'чужая модель', 10, 'other/model', ())
+        cache.saveSummary(runDate, newsFixtures.horizonDays, 'чужая модель', 10, 'other/model', (), configHash=self.configuration.configHash())
 
-        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model'))
+        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()))
 
     def test_failed_axes_survive_a_round_trip_through_the_cache(self):
         cache = NewsSummariesCache(self.cachePath)
         runDate = date.fromisoformat(newsFixtures.runDate)
-        cache.saveSummary(runDate, newsFixtures.horizonDays, 'неполное саммари', 10, 'test/model', ('курс', 'дкп'))
+        cache.saveSummary(runDate, newsFixtures.horizonDays, 'неполное саммари', 10, 'test/model', ('курс', 'дкп'), configHash=self.configuration.configHash())
 
         summary, documentsCount, failedAxes = cache.getSummary(
-            runDate, newsFixtures.horizonDays, 'test/model'
+            runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()
         )
 
         self.assertEqual('неполное саммари', summary)
@@ -588,9 +961,9 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
     def test_no_failed_axes_is_stored_as_empty_list_not_as_unknown(self):
         cache = NewsSummariesCache(self.cachePath)
         runDate = date.fromisoformat(newsFixtures.runDate)
-        cache.saveSummary(runDate, newsFixtures.horizonDays, 'полное саммари', 10, 'test/model', ())
+        cache.saveSummary(runDate, newsFixtures.horizonDays, 'полное саммари', 10, 'test/model', (), configHash=self.configuration.configHash())
 
-        self.assertEqual((), cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model')[2])
+        self.assertEqual((), cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash())[2])
 
         stored = sqlite3.connect(str(self.cachePath)).execute(
             'SELECT failed_axes FROM summaries WHERE run_date = ?', (runDate.isoformat(),)
@@ -602,16 +975,16 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         connection = sqlite3.connect(str(self.cachePath))
         connection.execute(
             """
-            INSERT INTO summaries (run_date, horizon_days, summary, doc_count, model, failed_axes)
-            VALUES (?, ?, ?, ?, ?, NULL)
+            INSERT INTO summaries (run_date, horizon_days, summary, doc_count, model, failed_axes, config_hash)
+            VALUES (?, ?, ?, ?, ?, NULL, ?)
             """,
-            (runDate.isoformat(), newsFixtures.horizonDays, 'саммари из blind_prophet', 10, 'test/model'),
+            (runDate.isoformat(), newsFixtures.horizonDays, 'саммари из blind_prophet', 10, 'test/model', self.configuration.configHash()),
         )
         connection.commit()
         connection.close()
 
         failedAxes = NewsSummariesCache(self.cachePath).getSummary(
-            runDate, newsFixtures.horizonDays, 'test/model'
+            runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()
         )[2]
 
         self.assertIsNone(failedAxes)
@@ -657,10 +1030,10 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         connection = sqlite3.connect(str(self.cachePath))
         connection.execute(
             """
-            INSERT INTO summaries (run_date, horizon_days, summary, doc_count, model, failed_axes)
-            VALUES (?, ?, ?, ?, ?, NULL)
+            INSERT INTO summaries (run_date, horizon_days, summary, doc_count, model, failed_axes, config_hash)
+            VALUES (?, ?, ?, ?, ?, NULL, ?)
             """,
-            (runDate.isoformat(), newsFixtures.horizonDays, 'старое саммари', 10, 'test/model'),
+            (runDate.isoformat(), newsFixtures.horizonDays, 'старое саммари', 10, 'test/model', self.configuration.configHash()),
         )
         connection.commit()
         connection.close()
@@ -682,11 +1055,12 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         cache = NewsSummariesCache(self.cachePath)
         runDate = date.fromisoformat(newsFixtures.runDate)
         storedAtMeta = {}
+        configHash = self.configuration.configHash()
 
         class InspectingSummarizer(StubSummarizer):
             async def buildMetaSummary(self, axisSummaries):
                 storedAtMeta.update(
-                    cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model')
+                    cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model', configHash=configHash)
                 )
                 return await super().buildMetaSummary(axisSummaries)
 
@@ -714,9 +1088,9 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         self.assertEqual(1, len(summarizer.metaInputs))
         self.assertEqual(
             {axis: f'саммари оси {axis}' for axis in self.configuration.axes},
-            cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model'),
+            cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()),
         )
-        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model'))
+        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()))
 
         recovered = StubSummarizer()
         context = NewsContextProvider(
@@ -731,7 +1105,7 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         secondAxis = list(self.configuration.axes)[1]
         NewsSummariesCache(self.cachePath).saveAxisSummaries(
             runDate, newsFixtures.horizonDays, 'test/model',
-            {secondAxis: 'из кеша'}, {secondAxis: 1},
+            {secondAxis: 'из кеша'}, {secondAxis: 1}, configHash=self.configuration.configHash(),
         )
         summarizer = StubSummarizer()
         NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer).prepare(runDate)
@@ -750,7 +1124,7 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         secondAxis = list(self.configuration.axes)[1]
         cache.saveAxisSummaries(
             runDate, newsFixtures.horizonDays, 'test/model',
-            {secondAxis: 'из кеша'}, {secondAxis: 1},
+            {secondAxis: 'из кеша'}, {secondAxis: 1}, configHash=self.configuration.configHash(),
         )
         summarizer = StubSummarizer()
         provider = NewsContextProvider(self.configuration, SilentLogger(), summarizer=summarizer)
@@ -766,7 +1140,7 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         cached = {axis: f'кеш {axis}' for axis in retrieved}
         cache.saveAxisSummaries(
             otherDate, newsFixtures.horizonDays, 'test/model',
-            cached, {axis: len(documents) for axis, documents in retrieved.items()},
+            cached, {axis: len(documents) for axis, documents in retrieved.items()}, configHash=self.configuration.configHash(),
         )
         allCached = StubSummarizer()
         logger = SilentLogger()
@@ -812,8 +1186,8 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         self.assertEqual(1, len(summarizer.axisInputs))
         self.assertEqual([], summarizer.metaInputs)
         cache = NewsSummariesCache(self.cachePath)
-        self.assertEqual(computed, cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model'))
-        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model'))
+        self.assertEqual(computed, cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()))
+        self.assertIsNone(cache.getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()))
 
         recovered = StubSummarizer()
         NewsContextProvider(self.configuration, SilentLogger(), summarizer=recovered).prepare(runDate)
@@ -849,7 +1223,7 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
 
         self.assertEqual(1, len(summarizer.metaInputs))
         self.assertIsNone(
-            NewsSummariesCache(self.cachePath).getSummary(runDate, newsFixtures.horizonDays, 'test/model'),
+            NewsSummariesCache(self.cachePath).getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()),
             'Провалившаяся дата не должна попадать в кеш',
         )
 
@@ -860,7 +1234,7 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         provider.prepare(runDate)
 
         stored = NewsSummariesCache(self.cachePath).getAxisSummaries(
-            runDate, newsFixtures.horizonDays, 'test/model'
+            runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()
         )
 
         self.assertEqual(set(self.configuration.axes), set(stored))
@@ -875,14 +1249,14 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         provider.prepare(runDate)
 
         stored = NewsSummariesCache(self.cachePath).getAxisSummaries(
-            runDate, newsFixtures.horizonDays, 'test/model'
+            runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()
         )
 
         self.assertNotIn(failedAxis, stored)
         self.assertNotIn(failedAxisPlaceholder, stored.values())
         self.assertEqual(len(self.configuration.axes) - 1, len(stored))
         summary = NewsSummariesCache(self.cachePath).getSummary(
-            runDate, newsFixtures.horizonDays, 'test/model'
+            runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()
         )
         self.assertEqual(('мета', sum(len(docs) for docs in provider.getContext(runDate).documents.values()),
                           (failedAxis,)), summary)
@@ -891,12 +1265,12 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         cache = NewsSummariesCache(self.cachePath)
         runDate = date.fromisoformat(newsFixtures.runDate)
         cache.saveAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model',
-                                {'курс': 'саммари'}, {'курс': 5})
+                                {'курс': 'саммари'}, {'курс': 5}, configHash=self.configuration.configHash())
 
         self.assertEqual({'курс': 'саммари'},
-                         cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model'))
-        self.assertEqual({}, cache.getAxisSummaries(runDate, newsFixtures.horizonDays + 1, 'test/model'))
-        self.assertEqual({}, cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'other/model'))
+                         cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash()))
+        self.assertEqual({}, cache.getAxisSummaries(runDate, newsFixtures.horizonDays + 1, 'test/model', configHash=self.configuration.configHash()))
+        self.assertEqual({}, cache.getAxisSummaries(runDate, newsFixtures.horizonDays, 'other/model', configHash=self.configuration.configHash()))
 
     def test_axis_document_counts_are_stored_alongside_summaries(self):
         provider = NewsContextProvider(self.configuration, SilentLogger(),
@@ -917,7 +1291,7 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         runDate = date.fromisoformat(newsFixtures.runDate)
 
         with self.assertRaises(NewsContextError) as raised:
-            NewsSummariesCache(legacyPath).getSummary(runDate, newsFixtures.horizonDays, 'test/model')
+            NewsSummariesCache(legacyPath).getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash())
 
         self.assertIn('axis_summaries', str(raised.exception))
         self.assertIn('013_axis_summaries.sql', str(raised.exception))
@@ -928,7 +1302,7 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
         runDate = date.fromisoformat(newsFixtures.runDate)
 
         with self.assertRaises(NewsContextError) as raised:
-            NewsSummariesCache(legacyPath).getSummary(runDate, newsFixtures.horizonDays, 'test/model')
+            NewsSummariesCache(legacyPath).getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash())
 
         self.assertIn('failed_axes', str(raised.exception))
         self.assertIn('012_summaries_failed_axes.sql', str(raised.exception))
@@ -945,16 +1319,16 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
                 connection = sqlite3.connect(str(path))
                 connection.execute(
                     """
-                    INSERT INTO summaries (run_date, horizon_days, summary, doc_count, model, failed_axes)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO summaries (run_date, horizon_days, summary, doc_count, model, failed_axes, config_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (runDate.isoformat(), newsFixtures.horizonDays, 'саммари', 10, 'test/model', stored),
+                    (runDate.isoformat(), newsFixtures.horizonDays, 'саммари', 10, 'test/model', stored, self.configuration.configHash()),
                 )
                 connection.commit()
                 connection.close()
 
                 with self.assertRaises(NewsContextError):
-                    NewsSummariesCache(path).getSummary(runDate, newsFixtures.horizonDays, 'test/model')
+                    NewsSummariesCache(path).getSummary(runDate, newsFixtures.horizonDays, 'test/model', configHash=self.configuration.configHash())
 
     def test_artefact_is_written_with_documents_and_configuration(self):
         artefactsFolder = self.folder / f'artefacts_{self.id()}'
@@ -978,3 +1352,671 @@ class TestNewsSummaryCaching(NewsFixtureTestCase):
             [document['message_id'] for document in artefact['documents'][newsFixtures.firstAxis]],
         )
         self.assertEqual(newsFixtures.horizonDays, artefact['config']['horizon_days'])
+
+
+class TestRunManifest(NewsFixtureTestCase):
+    def setUp(self):
+        self.runFolder = self.folder / self.id()
+        self.configuration = self.createConfiguration(mode=twoStageMode)
+        self.startedAt = datetime(2026, 9, 22, 10, 11, 12, 123456, tzinfo=UTC)
+        self.firstDate = date(2022, 3, 25)
+        self.nextDate = self.firstDate + timedelta(days=1)
+
+    def createManifest(self, startedAt=None):
+        return RunManifest(
+            'dry-construction', self.configuration, 'fixture/respondent',
+            'https://respondent.invalid/v1', self.runFolder / 'results',
+            self.runFolder / 'manifests', startedAt or self.startedAt,
+        )
+
+    def createProvider(self, outcomes):
+        context = SimpleNamespace(summary='саммари', summaryFromCache=True,
+                                  documentsCount=3, failedAxes=())
+        return SimpleNamespace(
+            prepare=Mock(side_effect=[context if value is None else value for value in outcomes]),
+            usageByDate={}, usageCompleteByDate={},
+        )
+
+    def test_manifest_sections_and_shared_hash_sources(self):
+        manifest = self.createManifest()
+        self.assertEqual(self.configuration.configHash(), manifest.data['news_rag']['config_hash'])
+        with patch.object(NewsRagConfiguration, 'configHash', return_value='cache-key-sentinel'):
+            self.assertEqual('cache-key-sentinel',
+                             self.createManifest().data['news_rag']['config_hash'])
+        for section in ('code_environment', 'corpus', 'news_rag', 'models',
+                        'prompt', 'respondent_data', 'totals'):
+            self.assertIn(section, manifest.data)
+        self.assertEqual(list(self.configuration.axes), manifest.data['news_rag']['axis_order'])
+        self.assertEqual(
+            {axis: queryListHash(texts) for axis, texts in self.configuration.axes.items()},
+            manifest.data['news_rag']['query_hash'],
+        )
+        self.assertEqual(newsRagConfiguration.windowRule,
+                         manifest.data['news_rag']['timezone_rule'])
+        self.assertEqual(3, manifest.data['news_rag']['utc_offset_hours'])
+        self.assertEqual(SummarizeConfig().model_dump(mode='json'),
+                         manifest.data['models']['summarization']['SummarizeConfig'])
+        self.assertEqual(self.configuration.summarizeProvider,
+                         manifest.data['models']['summarization']['configured_provider'])
+        self.assertIsNone(manifest.data['models']['summarization']['provider_pin_verification'])
+        self.assertEqual('not_checked', manifest.data['models']['summarization']
+                         ['provider_pin_verification_status'])
+
+    def test_collect_inputs_uses_reader_and_records_wave_hashes(self):
+        manifest = self.createManifest()
+        code = {'commit': 'fixture-commit', 'dirty': True, 'branch': 'fixture',
+                'amnesiac': {'tag': 'fixture-tag', 'commit': 'fixture-library-commit'}}
+        respondentData = {'seed42_verification': None}
+        with (patch('NewsLogic.RunManifest.readCodeEnvironment', return_value=code),
+              patch('NewsLogic.RunManifest.readRespondentData', return_value=respondentData)):
+            manifest.collectInputs(self.configuration, self.runFolder, 7)
+        with NewsCorpusReader(self.corpusPath) as reader:
+            self.assertEqual(reader.getCorpusManifest(), manifest.data['corpus'])
+        self.assertEqual('fixture-commit', manifest.data['code_environment']['commit'])
+        self.assertTrue(manifest.data['code_environment']['dirty'])
+        self.assertEqual(self.startedAt.isoformat(),
+                         manifest.data['code_environment']['started_at_utc'])
+        self.assertEqual(respondentData, manifest.data['respondent_data'])
+        self.runFolder.mkdir(parents=True)
+        (self.runFolder / 'wave.zip').write_bytes(b'fixture-wave')
+        result = readRespondentData(self.runFolder, self.runFolder / 'absent', 7)
+        self.assertEqual({str(self.runFolder / 'wave.zip'): sha256(b'fixture-wave').hexdigest()},
+                         result['wave_sha256'])
+        self.assertEqual(7, result['profiles_per_date'])
+        self.assertIsNone(result['seed42_verification'])
+        self.assertIsNone(result['extractor_commit'])
+        self.assertIsNone(result['extractor_seed'])
+
+    def test_code_environment_does_not_copy_installation_url(self):
+        installed = {'vcs_info': {'requested_revision': 'v0.fixture', 'commit_id': 'abc'},
+                     'url': 'https://secret:password@invalid/repo'}
+        with (patch('NewsLogic.RunManifest.subprocess.check_output',
+                    side_effect=['head\n', 'branch\n', ' M changed.py\n']) as command,
+              patch('NewsLogic.RunManifest.distribution') as package):
+            package.return_value.read_text.return_value = json.dumps(installed)
+            result = readCodeEnvironment(Path('.'))
+        self.assertEqual({'commit': 'head', 'branch': 'branch', 'dirty': True,
+                          'amnesiac': {'tag': 'v0.fixture', 'commit': 'abc'}}, result)
+        self.assertEqual(3, command.call_count)
+        self.assertNotIn('password', json.dumps(result))
+
+    def test_prompt_composition_is_read_from_builder(self):
+        manifest = self.createManifest()
+        builder = SimpleNamespace(builders=[SimpleNamespace(), Mock()],
+                                  headers=['Основные параметры опроса и респондента',
+                                           'Новости', 'Задача'])
+        manifest.recordPrompt(SimpleNamespace(), builder)
+        self.assertEqual(['SimpleNamespace', 'Mock'], manifest.data['prompt']['composition'])
+        self.assertEqual(builder.headers, manifest.data['prompt']['section_headers'])
+        self.assertIn('D-018', manifest.data['prompt']['experiments_configuration_note'])
+
+    def test_summarization_failure_is_recorded_and_following_date_runs(self):
+        manifest = self.createManifest()
+        provider = self.createProvider([SummarizeError('empty'), None])
+        logger = SilentLogger()
+        with manifest:
+            prepared = prepareContexts([self.firstDate, self.nextDate], provider, manifest, logger)
+        self.assertEqual([self.nextDate], prepared)
+        self.assertEqual([self.nextDate.isoformat()], manifest.data['totals']['dates_computed'])
+        self.assertEqual([{'date': self.firstDate.isoformat(),
+                           'reason': 'SummarizeError: суммаризация даты завершилась отказом'}],
+                         manifest.data['totals']['dates_skipped'])
+        self.assertEqual(1, manifest.data['totals']['skipped_count'])
+        self.assertEqual(2, provider.prepare.call_count)
+        self.assertIn('SKIPPED', logger.messages[0])
+        self.assertEqual('completed_with_skips',
+                         json.loads(manifest.path.read_text())['totals']['status'])
+
+    def test_uncovered_date_is_skipped_with_reason(self):
+        manifest = self.createManifest()
+        provider = self.createProvider([NewsContextUnavailableError('outside'), None])
+        prepared = prepareContexts([self.firstDate, self.nextDate], provider,
+                                   manifest, SilentLogger())
+        self.assertEqual([self.nextDate], prepared)
+        self.assertEqual('NewsContextUnavailableError: окно вне покрытия корпуса',
+                         manifest.data['totals']['dates_skipped'][0]['reason'])
+
+    def test_fatal_errors_propagate_and_partial_manifest_is_written(self):
+        errors = [NewsContextError('empty window'), ConfigurationError('configuration'),
+                  PromptRenderError('render'),
+                  TypeError('SECRET-programming-error'),
+                  AttributeError('SECRET-attribute'), KeyError('SECRET-key'),
+                  KeyboardInterrupt()]
+        for index, error in enumerate(errors):
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
+            provider = self.createProvider([None, error, None])
+            with self.assertRaises(type(error)), manifest:
+                prepareContexts([self.firstDate, self.nextDate, self.nextDate + timedelta(days=1)],
+                                provider, manifest, SilentLogger())
+            written = json.loads(manifest.path.read_text())
+            self.assertEqual('aborted', written['totals']['status'])
+            self.assertEqual(type(error).__name__, written['totals']['abort_type'])
+            self.assertEqual([self.firstDate.isoformat()], written['totals']['dates_computed'])
+            self.assertEqual([], written['totals']['dates_skipped'])
+            self.assertEqual(2, provider.prepare.call_count)
+            self.assertNotIn('SECRET', manifest.path.read_text())
+
+    def test_same_provider_failure_has_symmetric_axis_and_meta_outcomes(self):
+        from openai import APIConnectionError
+
+        secret = 'SECRET-provider-response'
+        providerError = APIConnectionError(message=secret, request=Mock())
+        axisError = TooManyAxisFailures({'дкп': repr(providerError)})
+        outcomes = []
+        for index, (error, stage) in enumerate(((axisError, 'axis'), (providerError, 'meta'))):
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
+            provider = self.createProvider([error, None])
+            logger = SilentLogger()
+            with manifest:
+                prepared = prepareContexts([self.firstDate, self.nextDate], provider,
+                                           manifest, logger)
+            written = json.loads(manifest.path.read_text())
+            totals = written['totals']
+            reason = totals['dates_skipped'][0]['reason']
+            self.assertIn(type(error).__name__, reason)
+            self.assertIn(f'stage={stage}', reason)
+            self.assertIn(reason, logger.messages[0])
+            self.assertNotIn(secret, manifest.path.read_text())
+            self.assertNotIn(repr(error), manifest.path.read_text())
+            self.assertNotIn(secret, '\n'.join(logger.messages))
+            outcomes.append((prepared, totals['status'], totals['skipped_count'],
+                             [entry['date'] for entry in totals['dates_skipped']],
+                             totals['dates_computed'], provider.prepare.call_count))
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(([self.nextDate], 'completed_with_skips', 1,
+                          [self.firstDate.isoformat()], [self.nextDate.isoformat()], 2),
+                         outcomes[0])
+
+        # Одинаковый отказ на любой стадии продвигает общий счётчик до трёх.
+        breakerOutcomes = []
+        dates = [self.firstDate + timedelta(days=index) for index in range(4)]
+        for index, errors in enumerate(((axisError, providerError, axisError),
+                                        (providerError, axisError, providerError))):
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index + 2))
+            provider = self.createProvider([*errors, None])
+            with self.assertRaises(SummarizationCircuitBreakerError), manifest:
+                prepareContexts(dates, provider, manifest, SilentLogger())
+            totals = json.loads(manifest.path.read_text())['totals']
+            breakerOutcomes.append((totals['status'], totals['abort_type'],
+                                    totals['circuit_breaker']['dates'], totals['skipped_count'],
+                                    totals['dates_computed'], provider.prepare.call_count))
+            for error, entry in zip(errors, totals['dates_skipped'], strict=True):
+                stage = 'axis' if isinstance(error, TooManyAxisFailures) else 'meta'
+                self.assertIn(type(error).__name__, entry['reason'])
+                self.assertIn(f'stage={stage}', entry['reason'])
+            self.assertNotIn(secret, manifest.path.read_text())
+        self.assertEqual(breakerOutcomes[0], breakerOutcomes[1])
+        self.assertEqual(('aborted', 'SummarizationCircuitBreakerError',
+                          [day.isoformat() for day in dates[:3]], 3, [], 3), breakerOutcomes[0])
+
+    def test_api_error_subclasses_skip_without_response_text(self):
+        from openai import (
+            APIError,
+            APIStatusError,
+            APITimeoutError,
+            InternalServerError,
+            PermissionDeniedError,
+            RateLimitError,
+        )
+
+        secret = 'SECRET-provider-response'
+        errors = [APIError(secret, request=Mock(), body=None),
+                  APITimeoutError(request=Mock())]
+        for errorClass, status in ((APIStatusError, 400), (PermissionDeniedError, 403),
+                                   (RateLimitError, 429), (InternalServerError, 500)):
+            errors.append(errorClass(secret, response=Mock(status_code=status), body=secret))
+        for index, error in enumerate(errors):
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
+            provider = self.createProvider([error, None])
+            with manifest:
+                self.assertEqual([self.nextDate], prepareContexts(
+                    [self.firstDate, self.nextDate], provider, manifest, SilentLogger()))
+            written = json.loads(manifest.path.read_text())
+            self.assertEqual(f'{type(error).__name__}: ошибка провайдера; stage=meta',
+                             written['totals']['dates_skipped'][0]['reason'])
+            self.assertNotIn(secret, manifest.path.read_text())
+            self.assertNotIn(str(error), manifest.path.read_text())
+            self.assertNotIn(repr(error), manifest.path.read_text())
+
+    def test_run_ids_and_back_references_do_not_overwrite(self):
+        first = self.createManifest()
+        second = self.createManifest(self.startedAt + timedelta(microseconds=1))
+        first.write()
+        original = first.path.read_bytes()
+        second.write()
+        self.assertNotEqual(first.runId, second.runId)
+        self.assertLess(first.runId, second.runId)
+        self.assertEqual(original, first.path.read_bytes())
+        self.assertTrue(second.path.exists())
+        for manifest in (first, second):
+            reference = json.loads((manifest.resultsFolder /
+                                    f'run_manifest_{manifest.runId}.json').read_text())
+            self.assertEqual(manifest.runId, reference['run_id'])
+            self.assertEqual(manifest.path.resolve(), Path(reference['manifest_path']))
+        duplicate = self.createManifest()
+        duplicate.data['totals']['abort_type'] = 'must-not-overwrite'
+        with self.assertRaises(FileExistsError):
+            duplicate.write()
+        self.assertEqual(original, first.path.read_bytes())
+
+    def test_secret_values_never_enter_rendered_manifest(self):
+        secret = 'test-secret-value-do-not-record'
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': secret}):
+            manifest = self.createManifest()
+            provider = self.createProvider([SummarizeError(secret), None])
+            with manifest:
+                prepareContexts([self.firstDate, self.nextDate], provider, manifest, SilentLogger())
+        rendered = manifest.path.read_text()
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(sha256(secret.encode()).hexdigest(), rendered)
+        self.assertNotIn('.env', rendered)
+        self.assertIn('OPENROUTER_API_KEY', rendered)
+
+
+    def test_main_writes_manifest_on_abort_and_contexts_only_return(self):
+        import runMySeriesWithNews as seriesRunner
+
+        cases = [(None, None), (NewsContextError('empty window'), None),
+                 (None, RuntimeError('SECRET-preflight'))]
+        for index, (error, preflightError) in enumerate(cases):
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
+            provider = self.createProvider([None, error])
+            provider.configuration = self.configuration
+            provider.summarizer = SimpleNamespace(preflight=AsyncMock(return_value=SimpleNamespace(
+                usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content='OK'))],
+            ), side_effect=preflightError))
+            builder = SimpleNamespace(builders=[], headers=['Новости'])
+            config = SimpleNamespace(bothub_key='unused-test-key', bothubUrl='https://invalid')
+            factory = SimpleNamespace(createNewsPromptBuilder=Mock(return_value=(builder, builder)))
+            helpers = SimpleNamespace(copyPromptTemplatesToFolder=Mock(), createAsyncSurveyRunner=Mock())
+            modules = {
+                'Configuration': SimpleNamespace(configuration=config),
+                'Configuration.configuration': config,
+                'SurveyLogic.PromptBuilders.profileBuildersHelpers': factory,
+                'SurveyLogic.surveyHelpers': helpers,
+            }
+            manifest.path.parent.mkdir(parents=True, exist_ok=True)
+            manifest.resultsFolder.mkdir(parents=True, exist_ok=True)
+            arguments = Namespace(horizon=14, experiment='test-main', model='fixture', profiles=7,
+                                  dates=Path('fixture-dates'), contexts_only=True,
+                                  allow_horizon_overwrite=False)
+            with (patch.dict(sys.modules, modules),
+                  patch.object(seriesRunner, 'RunManifest', return_value=manifest),
+                  patch.object(manifest, 'collectInputs'),
+                  patch.object(seriesRunner, 'NewsContextProvider', return_value=provider),
+                  patch.object(seriesRunner, 'SimpleLogger', return_value=SilentLogger()),
+                  patch.object(seriesRunner, 'readRunDates', return_value=[self.firstDate, self.nextDate]),
+                  patch.object(seriesRunner, 'splitByCoverage',
+                               return_value=([self.firstDate, self.nextDate], [])),
+                  patch.object(seriesRunner, 'findHorizonConflicts', return_value=[]),
+                  patch.object(Path, 'mkdir')):
+                if error is None and preflightError is None:
+                    seriesRunner.main(arguments)
+                else:
+                    with self.assertRaises(type(error or preflightError)):
+                        seriesRunner.main(arguments)
+            written = json.loads(manifest.path.read_text())
+            self.assertEqual('completed' if error is None and preflightError is None else 'aborted',
+                             written['totals']['status'])
+            expectedCount = 0 if preflightError else (2 if error is None else 1)
+            self.assertEqual(expectedCount, len(written['totals']['dates_computed']))
+            if preflightError:
+                provider.prepare.assert_not_called()
+                self.assertEqual('failed', written['preflight']['outcome'])
+                self.assertNotIn('SECRET-preflight', manifest.path.read_text())
+            helpers.createAsyncSurveyRunner.assert_not_called()
+            provider.summarizer.preflight.assert_awaited_once()
+
+    def test_provider_axis_failures_are_wrapped_and_trip_breaker_on_third_date(self):
+        from openai import PermissionDeniedError
+
+        configuration = replace(self.configuration, summarizeMaxFailedAxes=0)
+        summarizer = NewsSummarizer(configuration, SilentLogger())
+        secret = 'SECRET-provider-response'
+        create = AsyncMock(side_effect=PermissionDeniedError(
+            secret, response=Mock(status_code=403), body=None,
+        ))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        retrieved = {
+            axis: [NewsDocument(1, 'fixture', '2022-03-24T12:00:00+00:00',
+                               1, 'Цены растут.', axis, 1, 0.9)]
+            for axis in configuration.axes
+        }
+        cache = Mock()
+        cache.getSummary.return_value = None
+        cache.getAxisSummaries.return_value = {}
+        retriever = Mock()
+        retriever.retrieve.return_value = retrieved
+        retriever.getWindow.return_value = (self.firstDate - timedelta(days=14), self.firstDate)
+        provider = NewsContextProvider(configuration, SilentLogger(), retriever=retriever,
+                                       summarizer=summarizer, summariesCache=cache)
+        dates = [self.firstDate + timedelta(days=index) for index in range(4)]
+        manifest = self.createManifest()
+        with (patch.object(summarizer, '_createClient', return_value=client),
+              self.assertRaises(SummarizationCircuitBreakerError), manifest):
+            prepareContexts(dates, provider, manifest, SilentLogger())
+        written = json.loads(manifest.path.read_text())
+        self.assertEqual('aborted', written['totals']['status'])
+        self.assertEqual([day.isoformat() for day in dates[:3]],
+                         written['totals']['circuit_breaker']['dates'])
+        self.assertEqual('Три последовательных отказа суммаризации',
+                         written['totals']['circuit_breaker']['reason'])
+        self.assertEqual(3, retriever.retrieve.call_count)
+        self.assertEqual(3 * len(configuration.axes), create.await_count)
+        self.assertEqual(3, written['totals']['skipped_count'])
+        self.assertEqual([], written['totals']['dates_computed'])
+        for entry in written['totals']['dates_skipped']:
+            self.assertEqual(
+                'TooManyAxisFailures: суммаризация даты завершилась отказом; stage=axis; '
+                f'failed_axes={sorted(configuration.axes)}', entry['reason'],
+            )
+        self.assertNotIn(secret, manifest.path.read_text())
+        self.assertNotIn('PermissionDeniedError', manifest.path.read_text())
+
+    def test_breaker_resets_only_after_success_and_ignores_coverage(self):
+        failure = TooManyAxisFailures({'курс': 'SECRET', 'дкп': 'SECRET', 'труд': 'SECRET'})
+        coverage = NewsContextUnavailableError('outside')
+        computed = SimpleNamespace(summary='саммари', summaryFromCache=False,
+                                   documentsCount=3, failedAxes=())
+        outcomes = [failure, failure, computed, coverage, coverage, coverage,
+                    failure, coverage, failure, computed]
+        dates = [self.firstDate + timedelta(days=index) for index in range(len(outcomes))]
+        manifest = self.createManifest()
+        provider = self.createProvider(outcomes)
+        with manifest:
+            prepared = prepareContexts(dates, provider, manifest, SilentLogger())
+        self.assertEqual([dates[2], dates[9]], prepared)
+        self.assertEqual(len(dates), provider.prepare.call_count)
+        self.assertEqual('completed_with_skips', manifest.data['totals']['status'])
+        self.assertNotIn('circuit_breaker', manifest.data['totals'])
+        self.assertNotIn('SECRET', manifest.path.read_text())
+        self.assertEqual(
+            "TooManyAxisFailures: суммаризация даты завершилась отказом; stage=axis; "
+            "failed_axes=['дкп', 'курс', 'труд']",
+            manifest.data['totals']['dates_skipped'][0]['reason'],
+        )
+
+    def test_all_covered_dates_skipped_still_write_manifest_and_reference(self):
+        for index, error in enumerate((NewsContextUnavailableError('window'),
+                                       SummarizeError('summary'))):
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
+            provider = self.createProvider([error, error])
+            with manifest:
+                self.assertEqual([], prepareContexts(
+                    [self.firstDate, self.nextDate], provider, manifest, SilentLogger()))
+            self.assertTrue(manifest.path.exists())
+            written = json.loads(manifest.path.read_text())
+            self.assertEqual('completed_with_skips', written['totals']['status'])
+            self.assertEqual([], written['totals']['dates_computed'])
+            self.assertEqual(2, written['totals']['skipped_count'])
+            self.assertEqual([self.firstDate.isoformat(), self.nextDate.isoformat()],
+                             [entry['date'] for entry in written['totals']['dates_skipped']])
+            for entry in written['totals']['dates_skipped']:
+                self.assertIn(type(error).__name__, entry['reason'])
+                self.assertTrue(entry['reason'].split(': ')[1])
+            reference = json.loads((manifest.resultsFolder /
+                                    f'run_manifest_{manifest.runId}.json').read_text())
+            self.assertEqual(str(manifest.path.resolve()), reference['manifest_path'])
+            self.assertEqual(0, written['totals']['degraded_dates_count'])
+            self.assertEqual(0, written['totals']['unknown_degradation_dates_count'])
+
+    def test_manifest_write_failure_preserves_original_exception(self):
+        manifest = self.createManifest()
+        original = RuntimeError('original')
+        with (patch.object(manifest, 'write', side_effect=ValueError('assembly')),
+              self.assertRaises(RuntimeError) as caught, manifest):
+            raise original
+        self.assertIs(original, caught.exception)
+        self.assertEqual(['Манифест не записан: ValueError'], original.__notes__)
+        with (patch.object(manifest, 'write', side_effect=ValueError('assembly')),
+              self.assertRaisesRegex(ValueError, 'assembly'), manifest):
+            pass
+
+    def test_cache_hit_does_not_reset_breaker(self):
+        failure = SummarizeError('failure')
+        provider = self.createProvider([failure, failure, None, failure, None])
+        dates = [self.firstDate + timedelta(days=index) for index in range(5)]
+        manifest = self.createManifest()
+        with self.assertRaises(SummarizationCircuitBreakerError), manifest:
+            prepareContexts(dates, provider, manifest, SilentLogger())
+        self.assertEqual(4, provider.prepare.call_count)
+        self.assertEqual([dates[index].isoformat() for index in (0, 1, 3)],
+                         manifest.data['totals']['circuit_breaker']['dates'])
+
+    def test_preflight_records_served_provider_and_rejects_mismatch(self):
+        from openai.types.chat import ChatCompletion
+
+        for index, servedProvider in enumerate((self.configuration.summarizeProvider,
+                                                None, 'other/provider')):
+            responseData = {'id': 'fixture', 'object': 'chat.completion', 'created': 0,
+                            'model': 'fixture', 'choices': []}
+            if servedProvider is not None:
+                responseData['provider'] = servedProvider
+            response = ChatCompletion(**responseData)
+            provider = self.createProvider([None])
+            provider.configuration = self.configuration
+            provider.summarizer = SimpleNamespace(preflight=AsyncMock(return_value=response))
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
+            if servedProvider == 'other/provider':
+                with self.assertRaisesRegex(RuntimeError, 'несовпадение'), manifest:
+                    runPreflight(provider, manifest)
+                    prepareContexts([self.firstDate], provider, manifest, SilentLogger())
+                provider.prepare.assert_not_called()
+            else:
+                with manifest:
+                    runPreflight(provider, manifest)
+                    prepareContexts([self.firstDate], provider, manifest, SilentLogger())
+                provider.prepare.assert_called_once()
+            written = json.loads(manifest.path.read_text())
+            self.assertEqual(servedProvider,
+                             written['models']['summarization']['provider_pin_verification'])
+            self.assertEqual(('verified', 'not_reported', 'mismatch')[index],
+                             written['models']['summarization']['provider_pin_verification_status'])
+            self.assertEqual('failed' if index == 2 else 'succeeded',
+                             written['preflight']['outcome'])
+            self.assertEqual('aborted' if index == 2 else 'completed',
+                             written['totals']['status'])
+
+    def test_preflight_transport_and_auth_fail_before_dates(self):
+        from openai import APIConnectionError, AuthenticationError
+
+        errors = [APIConnectionError(request=Mock()),
+                  AuthenticationError('SECRET', response=Mock(status_code=401), body=None)]
+        for index, error in enumerate(errors):
+            provider = self.createProvider([None])
+            provider.configuration = self.configuration
+            provider.summarizer = SimpleNamespace(preflight=AsyncMock(side_effect=error))
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
+            with self.assertRaises(RuntimeError), manifest:
+                runPreflight(provider, manifest)
+                prepareContexts([self.firstDate], provider, manifest, SilentLogger())
+            provider.prepare.assert_not_called()
+            self.assertEqual('aborted', manifest.data['totals']['status'])
+            self.assertEqual(type(error).__name__, manifest.data['preflight']['error_type'])
+            self.assertNotIn('SECRET', manifest.path.read_text())
+
+    def test_empty_completed_manifest_is_an_assembly_error(self):
+        for status in ('completed', 'completed_with_skips', 'unexpected'):
+            manifest = self.createManifest()
+            manifest.data['totals']['status'] = status
+            self.assertEqual([], manifest.data['totals']['dates_skipped'])
+            with self.assertRaisesRegex(ValueError, 'dates_computed'):
+                manifest.write()
+            self.assertFalse(manifest.path.exists())
+        manifest = self.createManifest()
+        with self.assertRaisesRegex(ValueError, 'dates_computed'), manifest:
+            pass
+        self.assertFalse(manifest.path.exists())
+
+    def test_preflight_failure_prevents_date_preparation(self):
+        provider = self.createProvider([None])
+        provider.configuration = self.configuration
+        provider.summarizer = SimpleNamespace(preflight=AsyncMock(side_effect=RuntimeError('SECRET')))
+        manifest = self.createManifest()
+        with self.assertRaisesRegex(RuntimeError, self.configuration.summarizeProvider), manifest:
+            runPreflight(provider, manifest)
+            prepareContexts([self.firstDate], provider, manifest, SilentLogger())
+        provider.prepare.assert_not_called()
+        written = json.loads(manifest.path.read_text())
+        self.assertEqual('aborted', written['totals']['status'])
+        self.assertEqual([], written['totals']['dates_computed'])
+        self.assertEqual('failed', written['preflight']['outcome'])
+        self.assertFalse(written['totals']['usage_complete'])
+        self.assertNotIn('SECRET', manifest.path.read_text())
+
+    def test_preflight_usage_survives_per_date_updates(self):
+        manifest = self.createManifest()
+        response = SimpleNamespace(usage=SimpleNamespace(
+            prompt_tokens=2, completion_tokens=1, total_tokens=3, cost=0.00001,
+        ))
+        manifest.recordPreflight(response)
+        provider = self.createProvider([None])
+        provider.usageByDate[self.firstDate] = Usage(calls=2, total_tokens=17)
+        with manifest:
+            prepareContexts([self.firstDate], provider, manifest, SilentLogger())
+        self.assertEqual(20, manifest.data['totals']['usage']['total_tokens'])
+        self.assertEqual(3, manifest.data['totals']['usage']['calls'])
+        self.assertEqual(0.00001, manifest.data['totals']['preflight_reported_cost'])
+        self.assertTrue(manifest.data['totals']['usage_complete'])
+        self.assertEqual('completed', manifest.data['totals']['status'])
+        self.assertEqual(0, manifest.data['totals']['degraded_dates_count'])
+        self.assertEqual(0, manifest.data['totals']['unknown_degradation_dates_count'])
+
+    def test_preflight_missing_usage_and_empty_content(self):
+        for index, content in enumerate(('OK', '')):
+            provider = self.createProvider([None])
+            provider.configuration = self.configuration
+            provider.summarizer = SimpleNamespace(preflight=AsyncMock(return_value=SimpleNamespace(
+                usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            )))
+            manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
+            with manifest:
+                runPreflight(provider, manifest)
+                prepareContexts([self.firstDate], provider, manifest, SilentLogger())
+            provider.prepare.assert_called_once_with(self.firstDate)
+            self.assertEqual(1, manifest.data['totals']['usage']['calls'])
+            self.assertFalse(manifest.data['totals']['usage_complete'])
+            self.assertEqual('Провайдер не вернул usage', manifest.data['preflight']['usage_note'])
+            self.assertEqual('succeeded',
+                             manifest.data['preflight']['outcome'])
+
+    def test_degradation_and_unknown_axes_survive_json(self):
+        manifest = self.createManifest()
+        failure = MetaSummaryError(axis_summaries={}, failed_axes=[],
+                                   axis_errors={}, usage=Usage())
+        provider = self.createProvider([failure, None, None])
+        degraded = SimpleNamespace(summary='саммари', summaryFromCache=False,
+                                   documentsCount=7, failedAxes=('курс', 'труд'))
+        unknown = SimpleNamespace(summary='саммари', summaryFromCache=True,
+                                  documentsCount=8, failedAxes=None)
+        provider.prepare.side_effect = [failure, degraded, unknown]
+        thirdDate = self.nextDate + timedelta(days=1)
+        with manifest:
+            prepareContexts([self.firstDate, self.nextDate, thirdDate], provider,
+                            manifest, SilentLogger())
+        written = json.loads(manifest.path.read_text())
+        self.assertEqual(['курс', 'труд'],
+                         written['totals']['per_date'][self.nextDate.isoformat()]['failed_axes'])
+        self.assertEqual(7,
+                         written['totals']['per_date'][self.nextDate.isoformat()]['documents_count'])
+        self.assertIsNone(written['totals']['per_date'][thirdDate.isoformat()]['failed_axes'])
+        self.assertEqual(8,
+                         written['totals']['per_date'][thirdDate.isoformat()]['documents_count'])
+        self.assertEqual("MetaSummaryError: мета-вызов вернул пустое содержимое; stage=meta",
+                         written['totals']['dates_skipped'][0]['reason'])
+        self.assertEqual(1, written['totals']['degraded_dates_count'])
+        self.assertEqual(1, written['totals']['unknown_degradation_dates_count'])
+        self.assertNotIn('SECRET', manifest.path.read_text())
+
+
+
+class TestManifestUsage(NewsFixtureTestCase):
+    def setUp(self):
+        self.cachePath = self.folder / f'{self.id()}.db'
+        newsFixtures.createProjectDbFixture(self.cachePath)
+        self.configuration = self.createConfiguration(mode=twoStageMode,
+                                                       projectDbPath=self.cachePath)
+        self.runDate = date.fromisoformat(newsFixtures.runDate)
+        self.summarizer = StubSummarizer()
+        self.provider = NewsContextProvider(self.configuration, SilentLogger(),
+                                            summarizer=self.summarizer)
+
+    def test_usage_is_accumulated_once_and_cache_hit_is_explicit(self):
+        self.provider.prepare(self.runDate)
+        self.provider.prepare(self.runDate)
+        self.assertEqual(Usage(calls=3, total_tokens=137), self.provider.usageByDate[self.runDate])
+        cachedProvider = NewsContextProvider(self.configuration, SilentLogger(),
+                                             summarizer=ExplodingSummarizer())
+        context = cachedProvider.prepare(self.runDate)
+        manifest = RunManifest('usage', self.configuration, 'test', 'https://invalid',
+                               self.folder, self.folder / 'manifests')
+        manifest.recordUsage(self.runDate, cachedProvider, context)
+        self.assertEqual(Usage().model_dump(), manifest.data['totals']['usage'])
+        self.assertTrue(manifest.data['totals']['per_date'][self.runDate.isoformat()]
+                        ['summaryFromCache'])
+        manifest.recordUsage(self.runDate, self.provider, self.provider.getContext(self.runDate))
+        manifest.recordUsage(self.runDate, self.provider, self.provider.getContext(self.runDate))
+        self.assertEqual(137, manifest.data['totals']['usage']['total_tokens'])
+        self.assertFalse(manifest.data['totals']['per_date'][self.runDate.isoformat()]
+                         ['summaryFromCache'])
+
+    def test_failed_axes_usage_survives_skip(self):
+        self.summarizer.axisError = TooManyAxisFailures({'дкп': 'empty'},
+                                                       usage=Usage(calls=4, total_tokens=19))
+        manifest = RunManifest('axes-error', self.configuration, 'test', 'https://invalid',
+                               self.folder, self.folder / 'manifests')
+        self.assertEqual([], prepareContexts([self.runDate], self.provider, manifest, SilentLogger()))
+        self.assertEqual(Usage(calls=4, total_tokens=19).model_dump(), manifest.data['totals']['usage'])
+        self.assertIn('TooManyAxisFailures', manifest.data['totals']['dates_skipped'][0]['reason'])
+        self.assertTrue(manifest.data['totals']['usage_complete'])
+
+    def test_meta_failure_includes_successful_axes_usage(self):
+        self.summarizer.metaError = MetaSummaryError(
+            axis_summaries={}, failed_axes=[], axis_errors={}, usage=Usage(calls=3, total_tokens=17),
+        )
+        manifest = RunManifest('meta-error', self.configuration, 'test', 'https://invalid',
+                               self.folder, self.folder / 'manifests')
+        self.assertEqual([], prepareContexts([self.runDate], self.provider, manifest, SilentLogger()))
+        self.assertEqual(Usage(calls=5, total_tokens=117).model_dump(), manifest.data['totals']['usage'])
+        self.assertIn('MetaSummaryError', manifest.data['totals']['dates_skipped'][0]['reason'])
+
+    def test_meta_errors_after_degraded_axes_do_not_claim_no_failures(self):
+        from openai import APIConnectionError
+
+        secret = 'SECRET-meta-response'
+        errors = [MetaSummaryError(axis_summaries={'дкп': secret}, failed_axes=[],
+                                   axis_errors={}, usage=Usage()),
+                  APIConnectionError(message=secret, request=Mock())]
+        for index, error in enumerate(errors):
+            with self.subTest(error=type(error).__name__):
+                runDate = self.runDate + timedelta(days=index)
+                self.summarizer.failedAxes = ('дкп',)
+                self.summarizer.metaError = error
+                manifest = RunManifest(f'meta-error-{index}', self.configuration, 'test',
+                                       'https://invalid', self.folder,
+                                       self.folder / 'manifests')
+                logger = SilentLogger()
+                with manifest:
+                    self.assertEqual([], prepareContexts(
+                        [runDate], self.provider, manifest, logger))
+                written = json.loads(manifest.path.read_text())
+                reason = written['totals']['dates_skipped'][0]['reason']
+                self.assertIn(type(error).__name__, reason)
+                self.assertIn('stage=meta', reason)
+                self.assertNotIn('failed_axes=[]', reason)
+                if isinstance(error, MetaSummaryError):
+                    self.assertIn('мета-вызов вернул пустое содержимое', reason)
+                self.assertNotIn(secret, manifest.path.read_text())
+                self.assertNotIn(str(error), manifest.path.read_text())
+                self.assertNotIn(repr(error), manifest.path.read_text())
+                self.assertNotIn(secret, '\n'.join(logger.messages))
+
+    def test_transport_failure_marks_usage_incomplete_and_propagates(self):
+        self.summarizer.metaError = RuntimeError('transport')
+        manifest = RunManifest('transport', self.configuration, 'test', 'https://invalid',
+                               self.folder, self.folder / 'manifests')
+        with self.assertRaisesRegex(RuntimeError, 'transport'):
+            prepareContexts([self.runDate], self.provider, manifest, SilentLogger())
+        self.assertEqual(Usage(calls=2, total_tokens=100).model_dump(), manifest.data['totals']['usage'])
+        self.assertFalse(manifest.data['totals']['usage_complete'])
+        self.assertEqual([], manifest.data['totals']['dates_skipped'])

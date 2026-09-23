@@ -1,6 +1,10 @@
+import hashlib
+import json
 from dataclasses import dataclass, field, replace
 from datetime import timedelta, timezone
 from pathlib import Path
+
+from amnesiac.summarize.prompts import RU_MACRO_V1
 
 # Контракт корпуса. Несовпадение любого из этих значений означает, что векторы
 # документов и векторы осей посчитаны разными моделями, а внешне это никак не
@@ -13,6 +17,7 @@ corpusEmbeddingInput = 'lead'
 corpusDatePattern = (
     '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00'
 )
+windowRule = 'full_moscow_days_survey_day_excluded'
 moscowUtcOffsetHours = 3
 moscowTimeZone = timezone(timedelta(hours=moscowUtcOffsetHours))
 
@@ -23,7 +28,18 @@ supportedModes = (twoStageMode, rawMode)
 # Оси и тексты запросов, по которым посчитаны векторы в query_vectors.
 # Порядок значим: он задаёт порядок осевых блоков в мета-промпте и в секции raw.
 # Тексты менять нельзя — от них берётся query_hash, входящий в ключ вектора.
-defaultAxes: dict[str, list[str]] = {
+defaultAxisOrder = (
+    'дкп',
+    'инфляция',
+    'продовольствие',
+    'курс',
+    'тарифы',
+    'зарплаты',
+    'труд',
+    'кризис',
+    'бюджет',
+)
+defaultAxisQueries: dict[str, list[str]] = {
     'дкп': ['решение по ключевой ставке', 'денежно-кредитная политика Банка России'],
     'инфляция': ['рост потребительских цен', 'инфляция в России'],
     'продовольствие': ['цены на продукты питания'],
@@ -38,6 +54,32 @@ defaultAxes: dict[str, list[str]] = {
     ],
     'бюджет': ['бюджетные расходы', 'дефицит бюджета'],
 }
+assert set(defaultAxisOrder) == set(defaultAxisQueries), 'Состав осей и их порядок расходятся'
+defaultAxes = {axis: defaultAxisQueries[axis] for axis in defaultAxisOrder}
+
+
+# Каждое поле конфигурации должно попасть ровно в один из двух списков.
+configHashFields = (
+    'axes',
+    'topKPerAxis',
+    'dedupThreshold',
+    'excludeChannels',
+    'mode',
+    'summarizeTemperature',
+    'summarizeMaxFailedAxes',
+    'summarizeBaseUrl',
+    'summarizeProvider',
+)
+configHashExcludedFields = (
+    'horizonDays',  # Уже в ключе кеша.
+    'summarizeModel',  # Уже в ключе кеша.
+    'summarizeApiKeyVariable',
+    'summarizeConcurrency',
+    'summarizeTimeout',
+    'corpusPath',
+    'projectDbPath',
+    'artefactsFolder',
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +96,8 @@ class NewsRagConfiguration:
 
     summarizeModel: str = 'deepseek/deepseek-v4-flash'
     summarizeBaseUrl: str = 'https://openrouter.ai/api/v1'
+    # Провайдер закреплён в каждом запросе суммаризации и входит в config_hash.
+    summarizeProvider: str = 'deepinfra/fp8'
     summarizeApiKeyVariable: str = 'OPENROUTER_API_KEY'
     summarizeTemperature: float = 0.3
     summarizeConcurrency: int = 5
@@ -73,6 +117,20 @@ class NewsRagConfiguration:
             raise ValueError(f'topKPerAxis must be positive, got {self.topKPerAxis}')
         if not self.axes:
             raise ValueError('axes cannot be empty')
+
+    def configHash(self) -> str:
+        """Хеш значимых параметров кеша; горизонт и модель уже входят в ключ."""
+        payload = {name: getattr(self, name) for name in configHashFields}
+        payload.update(
+            {
+                'axes': [[axis, list(queries)] for axis, queries in self.axes.items()],
+                'windowRule': windowRule,
+                'moscowUtcOffsetHours': moscowUtcOffsetHours,
+                'summarizePromptPack': RU_MACRO_V1.model_dump(exclude={'params'}),
+            }
+        )
+        serialized = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+        return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
     def withArtefactsFolder(self, artefactsFolder: Path) -> 'NewsRagConfiguration':
         return replace(self, artefactsFolder=artefactsFolder)

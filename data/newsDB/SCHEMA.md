@@ -63,7 +63,8 @@ CREATE TABLE summaries (
     doc_count     INTEGER,
     model         TEXT,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    failed_axes   TEXT
+    failed_axes   TEXT,
+    config_hash   TEXT
 );
 
 CREATE TABLE axis_summaries (
@@ -74,6 +75,7 @@ CREATE TABLE axis_summaries (
     summary       TEXT NOT NULL,
     doc_count     INTEGER,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    config_hash   TEXT,
     PRIMARY KEY (run_date, axis)
 );
 
@@ -103,6 +105,7 @@ CREATE TABLE migrations (
 | `doc_count` | INTEGER | нет | сколько документов ушло в суммаризацию |
 | `model` | TEXT | нет | модель суммаризации |
 | `created_at` | TIMESTAMP | авто | когда посчитано |
+| `config_hash` | TEXT | нет | SHA-256 значимых параметров конфигурации; несовпадение или NULL — промах кеша |
 | `failed_axes` | TEXT | нет | JSON-массив осей, по которым саммари не собралось |
 
 ### Окно сбора
@@ -156,9 +159,61 @@ CREATE TABLE migrations (
 Это единственная колонка, без которой саммари невоспроизводимо, поэтому она
 `NOT NULL`.
 
-Того же рода переменные, которых в ключе **нет**: правило часового пояса,
-порядок осей и провайдер маршрутизации. Они фиксируются манифестом прогона
-(D-025), а не базой.
+Правило часового пояса, порядок осей и провайдер маршрутизации входят в
+`config_hash` (D-031). Обе таблицы сверяют его вместе с горизонтом и моделью;
+манифест прогона (D-025) должен использовать тот же метод `configHash()`.
+
+### `config_hash` — конфигурация обоих уровней кеша
+
+Расхождение с blind_prophet: миграция `015_summaries_config_hash.sql` добавляет
+`config_hash TEXT` в обе таблицы. Метод `NewsRagConfiguration.configHash()` —
+единственный источник хеша для кеша и будущего манифеста. Чтение сверяет
+`(run_date, horizon_days, model, config_hash)`; для осевых строк также `axis`.
+Иной хеш или `NULL` означает отсутствие подходящей строки. Физические ключи
+`UNIQUE(run_date)` и `PRIMARY KEY(run_date, axis)` не меняются: запись заменяет
+предыдущую конфигурацию, история не сохраняется. Отсутствующая колонка в любой
+таблице — ошибка с указанием миграции, а не разрешение использовать старый кеш.
+Обе таблицы перед применением пусты; значения по умолчанию и back-fill не нужны.
+
+Состав JSON в фактическом порядке сериализации (ключи отсортированы):
+
+1. `axes`: список пар `[имя оси, [запрос, ...]]` в порядке `configuration.axes`;
+   учитываются и порядок осей, и точные тексты запросов.
+2. `dedupThreshold`.
+3. `excludeChannels` (список).
+4. `mode`.
+5. `moscowUtcOffsetHours` (сейчас `3`).
+6. `summarizeBaseUrl`.
+7. `summarizeMaxFailedAxes`.
+8. `summarizePromptPack`: `RU_MACRO_V1.model_dump(exclude={'params'})` до `bind`.
+   Внутренние ключи также сортируются: `axis_block_separator`,
+   `axis_block_template`, `axis_system`, `axis_user`, `doc_separator`,
+   `doc_template`, `meta_system`, `meta_user`, `name`. Хешируются реальные
+   тексты шаблонов и разделителей, а не только имя пакета.
+9. `summarizeProvider` (по умолчанию `deepinfra/fp8`; провайдер закреплён
+   в каждом запросе суммаризации и участвует в `config_hash`).
+10. `summarizeTemperature`.
+11. `topKPerAxis`.
+12. `windowRule`: литерал `full_moscow_days_survey_day_excluded`, обозначающий
+    полные московские сутки с исключением всего дня опроса (D-015).
+
+Каноническая сериализация: `json.dumps(payload, sort_keys=True,
+separators=(',', ':'), ensure_ascii=False)`, затем UTF-8 и SHA-256 hex.
+Порядок ключей объектов и исходное форматирование не влияют на результат;
+порядок осей сохраняется массивом пар и влияет. При изменении семантики окна
+нужно менять `windowRule`, даже если смещение часового пояса осталось прежним.
+
+Намеренно исключены:
+
+- `horizonDays`, `summarizeModel`: уже сверяются отдельными частями ключа.
+- `summarizeConcurrency`, `summarizeTimeout`: параметры скорости выполнения.
+- `summarizeApiKeyVariable`: имя источника секрета, а не параметр результата.
+  Значение ключа не читается для хеша и не попадает в логи или артефакты.
+- `corpusPath`, `projectDbPath`, `artefactsFolder`: расположение файлов.
+- `params` пакета промптов: связанный `horizon_days` иначе дублировал бы ключ.
+
+Хеш не кодирует изменения алгоритма при неизменных параметрах. Ручная
+инвалидация по D-031 по-прежнему очищает **обе** таблицы вместе.
 
 ### `UNIQUE(run_date)` — одно саммари на дату
 
@@ -207,8 +262,8 @@ CREATE TABLE migrations (
 
 ```sql
 INSERT OR REPLACE INTO summaries
-    (run_date, horizon_days, summary, doc_count, model, failed_axes)
-VALUES (?, ?, ?, ?, ?, ?);
+    (run_date, horizon_days, summary, doc_count, model, failed_axes, config_hash)
+VALUES (?, ?, ?, ?, ?, ?, ?);
 ```
 
 ```sql
@@ -237,6 +292,7 @@ WHERE failed_axes IS NOT NULL AND failed_axes != '[]';
 | `summary` | TEXT | да | текст осевого саммари |
 | `doc_count` | INTEGER | нет | сколько документов отобрано по этой оси |
 | `created_at` | TIMESTAMP | авто | когда посчитано |
+| `config_hash` | TEXT | нет | SHA-256 значимых параметров конфигурации; несовпадение или NULL — промах кеша |
 
 Ключ `(run_date, axis)`: на дату по строке на ось, как в `summaries` одна строка
 на дату. `horizon_days` и `model` дублируются здесь намеренно — строка должна
@@ -309,6 +365,7 @@ HAVING axes_stored < 9;
 | `012_summaries_failed_axes` | колонка `failed_axes` в `summaries` |
 | `013_axis_summaries` | таблица `axis_summaries` |
 | `014_drop_blind_prophet_tables` | удаляет `neutered_summaries` и `forecasts` |
+| `015_summaries_config_hash` | колонка `config_hash` в `summaries` и `axis_summaries` |
 
 С номера `012` последовательность локальная: если blind_prophet заведёт
 собственную `012`, номера совпадут при разном содержании. Расхождение

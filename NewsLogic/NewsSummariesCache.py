@@ -6,6 +6,7 @@ from pathlib import Path
 from NewsLogic.newsExceptions import NewsContextError
 
 failedAxesMigration = 'data/newsDB/migrations/012_summaries_failed_axes.sql'
+configHashMigration = 'data/newsDB/migrations/015_summaries_config_hash.sql'
 axisSummariesMigration = 'data/newsDB/migrations/013_axis_summaries.sql'
 
 
@@ -14,7 +15,7 @@ class NewsSummariesCache:
 
     Суммаризация одной даты — десять вызовов LLM, а builder вызывается на
     каждого респондента, поэтому кеш обязателен. Ключ таблицы — `UNIQUE(run_date)`,
-    то есть на дату хранится ровно одно актуальное саммари; горизонт и модель
+    то есть на дату хранится ровно одно актуальное саммари; горизонт, модель и хеш конфигурации
     сверяются при чтении, чтобы чужая строка не подменила результат молча.
 
     Вместе с текстом хранятся отказавшие оси. Без них саммари, собранное из
@@ -28,7 +29,7 @@ class NewsSummariesCache:
         self.projectDbPath = Path(projectDbPath)
 
     def getSummary(
-        self, runDate: date, horizonDays: int, model: str
+        self, runDate: date, horizonDays: int, model: str, configHash: str
     ) -> tuple[str, int, tuple[str, ...] | None] | None:
         connection = self._connect()
         try:
@@ -36,9 +37,9 @@ class NewsSummariesCache:
                 """
                 SELECT summary, doc_count, horizon_days, model, failed_axes
                 FROM summaries
-                WHERE run_date = ?
+                WHERE run_date = ? AND config_hash = ?
                 """,
-                (runDate.isoformat(),),
+                (runDate.isoformat(), configHash),
             ).fetchone()
         finally:
             connection.close()
@@ -60,14 +61,15 @@ class NewsSummariesCache:
         documentsCount: int,
         model: str,
         failedAxes: tuple[str, ...],
+        configHash: str,
     ) -> None:
         connection = self._connect()
         try:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO summaries
-                    (run_date, horizon_days, summary, doc_count, model, failed_axes)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (run_date, horizon_days, summary, doc_count, model, failed_axes, config_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     runDate.isoformat(),
@@ -76,6 +78,7 @@ class NewsSummariesCache:
                     documentsCount,
                     model,
                     json.dumps(list(failedAxes), ensure_ascii=False),
+                    configHash,
                 ),
             )
             connection.commit()
@@ -89,6 +92,7 @@ class NewsSummariesCache:
         model: str,
         axisSummaries: dict[str, str],
         documentCounts: dict[str, int],
+        configHash: str,
     ) -> None:
         """Сохранить осевые саммари первого этапа.
 
@@ -104,11 +108,14 @@ class NewsSummariesCache:
             connection.executemany(
                 """
                 INSERT OR REPLACE INTO axis_summaries
-                    (run_date, axis, horizon_days, model, summary, doc_count)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (run_date, axis, horizon_days, model, summary, doc_count, config_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    (runDate.isoformat(), axis, horizonDays, model, summary, documentCounts.get(axis))
+                    (
+                        runDate.isoformat(), axis, horizonDays, model, summary,
+                        documentCounts.get(axis), configHash,
+                    )
                     for axis, summary in axisSummaries.items()
                 ],
             )
@@ -116,7 +123,9 @@ class NewsSummariesCache:
         finally:
             connection.close()
 
-    def getAxisSummaries(self, runDate: date, horizonDays: int, model: str) -> dict[str, str]:
+    def getAxisSummaries(
+        self, runDate: date, horizonDays: int, model: str, configHash: str
+    ) -> dict[str, str]:
         """Осевые саммари даты. Пустой словарь, если их нет или они чужие."""
         connection = self._connect()
         try:
@@ -124,10 +133,10 @@ class NewsSummariesCache:
                 """
                 SELECT axis, summary
                 FROM axis_summaries
-                WHERE run_date = ? AND horizon_days = ? AND model = ?
+                WHERE run_date = ? AND horizon_days = ? AND model = ? AND config_hash = ?
                 ORDER BY axis
                 """,
-                (runDate.isoformat(), horizonDays, model),
+                (runDate.isoformat(), horizonDays, model, configHash),
             ).fetchall()
         finally:
             connection.close()
@@ -182,5 +191,14 @@ class NewsSummariesCache:
                 f'В проектной базе {self.projectDbPath} нет таблицы axis_summaries: {error}. '
                 f'Примените миграцию: sqlite3 {self.projectDbPath} < {axisSummariesMigration}'
             ) from error
+
+        for table in ('summaries', 'axis_summaries'):
+            columns = {row[1] for row in connection.execute(f'PRAGMA table_info({table})')}
+            if 'config_hash' not in columns:
+                connection.close()
+                raise NewsContextError(
+                    f'В таблице {table} базы {self.projectDbPath} нет колонки config_hash. '
+                    f'Примените миграцию: sqlite3 {self.projectDbPath} < {configHashMigration}'
+                )
 
         return connection
