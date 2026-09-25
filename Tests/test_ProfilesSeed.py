@@ -34,7 +34,7 @@ class ProfilesSeedTests(unittest.TestCase):
 
     def testIdentical(self):
         result, _ = self.compare()
-        self.assertEqual(result['verdict'], 'passed')
+        self.assertEqual(result['verdict'], 'verified')
         self.assertEqual(result['matched_count'], 2)
         self.assertEqual(result['content_different_count'], 0)
         self.assertEqual(result['profile_counts'], {'original': 2, 'extracted': 2})
@@ -80,7 +80,7 @@ class ProfilesSeedTests(unittest.TestCase):
         verification = {
             'seed': 42,
             'extractor_commit': 'commit-recorded-by-check',
-            'verdict': 'passed',
+            'verdict': 'verified',
             'checked_at_utc': '2026-09-22T12:00:00+00:00',
             'scope': 'selected_years',
             'years': {'2020': comparison},
@@ -93,7 +93,7 @@ class ProfilesSeedTests(unittest.TestCase):
         self.assertEqual(
             result['seed42_verification'],
             {
-                'verdict': 'passed',
+                'verdict': 'verified',
                 'checked_at_utc': verification['checked_at_utc'],
                 'scope': 'selected_years',
                 'aggregate_sha256': {'2020': comparison['aggregate_sha256']},
@@ -109,7 +109,7 @@ class ProfilesSeedTests(unittest.TestCase):
 
     def testMissingResultIsExplicitlyUnverified(self):
         result = readRespondentData(self.original, self.extracted, 100, self.root / 'absent.json')
-        self.assertIsNone(result['extractor_seed'])
+        self.assertEqual(result['extractor_seed'], 42)
         self.assertIsNone(result['extractor_commit'])
         self.assertIsNone(result['seed42_verification'])
         self.assertIn('не проверено', result['provenance_status'])
@@ -157,7 +157,7 @@ class ProfilesSeedTests(unittest.TestCase):
         ):
             result = verifyProfiles(self.root, ['2020'])
             self.assertEqual(len(constructor.call_args.args), 4)
-        self.assertEqual(result['verdict'], 'passed')
+        self.assertEqual(result['verdict'], 'verified')
         self.assertEqual(result['seed'], 42)
         self.assertEqual(result['extractor_commit'], 'fixture-commit')
         self.assertTrue(result['inputs_unchanged'])

@@ -1425,7 +1425,7 @@ class TestRunManifest(NewsFixtureTestCase):
         self.assertEqual(7, result['profiles_per_date'])
         self.assertIsNone(result['seed42_verification'])
         self.assertIsNone(result['extractor_commit'])
-        self.assertIsNone(result['extractor_seed'])
+        self.assertEqual(result['extractor_seed'], 42)
 
     def test_code_environment_does_not_copy_installation_url(self):
         installed = {'vcs_info': {'requested_revision': 'v0.fixture', 'commit_id': 'abc'},

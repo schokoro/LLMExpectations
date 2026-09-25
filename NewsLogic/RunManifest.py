@@ -1,6 +1,7 @@
 """Провенанс и итоги серии; сборка не требует запуска опроса."""
 
 import hashlib
+import inspect
 import json
 import re
 import subprocess
@@ -17,6 +18,8 @@ from NewsLogic.NewsContext import NewsContext
 from NewsLogic.NewsContextProvider import NewsContextProvider
 from NewsLogic.NewsCorpusReader import NewsCorpusReader, queryListHash
 from NewsLogic.NewsRagConfiguration import NewsRagConfiguration
+from RLMSLogic.ProfileHashes import aggregateDigest, hashDirectory
+from RLMSLogic.RLMSProfileExtractor import RLMSProfileExtractor
 from SurveyLogic.PromptBuilders.BasePromptBuilder import BasePromptBuilder
 from SurveyLogic.PromptBuilders.CompositePromptBuilder import CompositePromptBuilder
 
@@ -43,7 +46,7 @@ def readRespondentData(
     wavesFolder: Path,
     profilesFolder: Path,
     profilesCount: int,
-    verificationPath: Path = Path('data/run_manifests/seed42_verification.json'),
+    verificationPath: Path | None = None,
 ) -> dict:
     """Хешировать имеющиеся волны; происхождение старых профилей не угадывать."""
     waveHashes = {}
@@ -52,7 +55,21 @@ def readRespondentData(
             with path.open('rb') as source:
                 waveHashes[str(path)] = hashlib.file_digest(source, 'sha256').hexdigest()
     respondentData = {
-        'extractor_seed': None,
+        'extractor_seed': (
+            inspect.signature(RLMSProfileExtractor.generateAndSaveProfilesFromRLMS)
+            .parameters['seed']
+            .default
+        ),
+        'profiles_sha256': (
+            aggregateDigest(hashDirectory(profilesFolder)) if profilesFolder.is_dir() else None
+        ),
+        'profiles_sha256_by_year': {
+            folder.name: aggregateDigest(hashDirectory(folder))
+            for folder in sorted(profilesFolder.iterdir())
+            if folder.is_dir()
+        }
+        if profilesFolder.is_dir()
+        else {},
         'extractor_commit': None,
         'seed42_verification': None,
         'provenance_status': 'Происхождение не проверено: файл seed42_verification.json отсутствует',
@@ -61,10 +78,14 @@ def readRespondentData(
         'profile_files_available': sum(1 for _ in profilesFolder.rglob('*.json')),
     }
 
-    if verificationPath.is_file():
+    if verificationPath is None:
+        respondentData['provenance_status'] = (
+            'Происхождение не проверено: результат проверки хранится вне репозитория; '
+            'сравнение через profiles_sha256_by_year'
+        )
+    elif verificationPath.is_file():
         verification = json.loads(verificationPath.read_text(encoding='utf-8'))
         respondentData.update(
-            extractor_seed=verification['seed'],
             extractor_commit=verification['extractor_commit'],
             seed42_verification={
                 'verdict': verification['verdict'],

@@ -1,6 +1,6 @@
 """Проверка повторного извлечения профилей без изменения исходных данных.
 
-.venv/bin/python -B -u checkProfilesSeed.py [--years 2020 2021]
+.venv/bin/python -B -u checkProfilesSeed.py --output PATH [--years 2020 2021]
 """
 
 import argparse
@@ -14,28 +14,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import BadZipFile, ZipFile
 
+from RLMSLogic.ProfileHashes import aggregateDigest, hashDirectory
+
 # Импорт экстрактора не должен создавать __pycache__ вне временного каталога.
 sys.dont_write_bytecode = True
-
-
-def hashDirectory(folder: Path) -> dict[str, str]:
-    """Снять хеши байтов всех файлов с относительными именами."""
-    if not folder.is_dir():
-        raise FileNotFoundError(f'Нет каталога: {folder}')
-    hashes = {}
-    for path in folder.rglob('*'):
-        if path.is_file():
-            with path.open('rb') as source:
-                hashes[path.relative_to(folder).as_posix()] = hashlib.file_digest(
-                    source, 'sha256'
-                ).hexdigest()
-    return hashes
-
-
-def aggregateDigest(hashes: dict[str, str]) -> str:
-    """SHA256 от отсортированных строк name:hash, каждая заканчивается LF."""
-    pairs = ''.join(f'{name}:{hashes[name]}\n' for name in sorted(hashes))
-    return hashlib.sha256(pairs.encode('utf-8')).hexdigest()
 
 
 def compareProfiles(year: str, originalFolder: Path, extractedFolder: Path) -> dict:
@@ -49,7 +31,7 @@ def compareProfiles(year: str, originalFolder: Path, extractedFolder: Path) -> d
     passed = bool(original) and not (changed or originalOnly or extractedOnly)
     result = {
         'year': year,
-        'verdict': 'passed' if passed else 'failed',
+        'verdict': 'verified' if passed else 'failed',
         'matched_count': len(common) - len(changed),
         'content_different_count': len(changed),
         'content_different': changed,
@@ -137,24 +119,34 @@ def verifyProfiles(repository: Path, years: list[str] | None = None) -> dict:
         )
         with TemporaryDirectory(prefix='profiles-seed42-') as temporary:
             for year in selected:
-                source = Path(temporary) / year / 'wave'
-                target = Path(temporary) / year / 'profiles'
-                source.mkdir(parents=True)
-                with ZipFile(wavesFolder / f'{year}.zip') as archive:
-                    for member in archive.infolist():
-                        if (
-                            not (source / member.filename)
-                            .resolve()
-                            .is_relative_to(source.resolve())
-                        ):
-                            raise ValueError('Путь в архиве выходит из временного каталога')
-                    archive.extractall(source)
-                # Seed намеренно не передаётся: проверяется default экстрактора.
-                extractor.generateAndSaveProfilesFromRLMS(source, target, sampleSize, adultAge)
-                result['years'][year] = compareProfiles(year, profilesFolder / year, target)
+                targets = []
+                for attempt in range(2):
+                    source = Path(temporary) / year / str(attempt) / 'wave'
+                    target = source.parent / 'profiles'
+                    source.mkdir(parents=True)
+                    with ZipFile(wavesFolder / f'{year}.zip') as archive:
+                        members = archive.infolist()
+                        if attempt == 1:
+                            members = list(reversed(members))
+                        for member in members:
+                            if (
+                                not (source / member.filename)
+                                .resolve()
+                                .is_relative_to(source.resolve())
+                            ):
+                                raise ValueError('Путь в архиве выходит из временного каталога')
+                        archive.extractall(source, members=members)
+                    # Seed намеренно не передаётся: проверяется default экстрактора.
+                    extractor.generateAndSaveProfilesFromRLMS(source, target, sampleSize, adultAge)
+                    targets.append(target)
+                comparison = compareProfiles(year, profilesFolder / year, targets[0])
+                comparison['independent_extractions'] = compareProfiles(year, *targets)
+                if comparison['independent_extractions']['verdict'] != 'verified':
+                    comparison['verdict'] = 'failed'
+                result['years'][year] = comparison
         result['verdict'] = (
-            'passed'
-            if all(item['verdict'] == 'passed' for item in result['years'].values())
+            'verified'
+            if all(item['verdict'] == 'verified' for item in result['years'].values())
             else 'failed'
         )
     except (
@@ -185,17 +177,20 @@ def main() -> int:
     """Записать результат отдельно от запусков опроса; красный результат даёт exit 1."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--years', nargs='+', help='Годы архивов, например 2020 2021')
+    parser.add_argument('--output', type=Path, required=True, help='Путь результата вне манифестов')
     arguments = parser.parse_args()
     repository = Path(__file__).resolve().parent
+    resultPath = arguments.output.resolve()
+    if resultPath.is_relative_to((repository / 'data/run_manifests').resolve()):
+        parser.error('Результат проверки нельзя сохранять в data/run_manifests/')
     result = verifyProfiles(repository, arguments.years)
-    resultPath = repository / 'data/run_manifests/seed42_verification.json'
     resultPath.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(f'Исходные данные неизменны: {result["inputs_unchanged"]}')
     if 'error' in result:
         print(result['error'])
     print(f'Результат: {resultPath}')
-    print('ЗЕЛЁНЫЙ' if result['verdict'] == 'passed' else 'КРАСНЫЙ')
-    return 0 if result['verdict'] == 'passed' else 1
+    print('ЗЕЛЁНЫЙ' if result['verdict'] == 'verified' else 'КРАСНЫЙ')
+    return 0 if result['verdict'] == 'verified' else 1
 
 
 if __name__ == '__main__':

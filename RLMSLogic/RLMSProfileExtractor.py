@@ -269,7 +269,7 @@ class RLMSProfileExtractor:
 
     def generateAndSaveProfilesFromRLMS(self, rlmsProfilesFolder: Path, folderPath: Path, sample_size: int, adultAge: int, seed: int = 42):
         pattern = os.path.join(str(rlmsProfilesFolder), "*.json")
-        json_files = glob.glob(pattern)
+        json_files = sorted(glob.glob(pattern))
 
         total = len(json_files)
         if sample_size <= 0 or sample_size > total:
