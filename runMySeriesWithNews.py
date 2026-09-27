@@ -14,11 +14,13 @@ import argparse
 import asyncio
 import re
 import sqlite3
+import time
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
 from amnesiac.exceptions import MetaSummaryError, SummarizeError, TooManyAxisFailures
-from openai import APIError
+from openai import APIConnectionError, APIError, InternalServerError, RateLimitError
 
 from Logging.SimpleLogger import SimpleLogger
 from NewsLogic.NewsContextProvider import NewsContextProvider
@@ -30,6 +32,7 @@ from NewsLogic.RunManifest import RunManifest
 defaultHorizonDays = 14
 defaultProfilesCount = 100
 defaultModel = 'qwen3.8-27b'
+preflightRetryDelays = (5.0, 15.0)
 
 
 def readRunDates(path: Path) -> list[date]:
@@ -103,18 +106,34 @@ class SummarizationCircuitBreakerError(RuntimeError):
     """Три последовательных отказа суммаризации требуют остановки серии."""
 
 
-def runPreflight(provider: NewsContextProvider, manifest: RunManifest) -> None:
+def runPreflight(
+    provider: NewsContextProvider, manifest: RunManifest,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
     """Проверить доступность закреплённого провайдера до подготовки дат."""
     configuration = provider.configuration
+    transientErrors = []
+    attempts = 0
     try:
-        response = asyncio.run(provider.summarizer.preflight())
-        manifest.recordPreflight(response)
+        for attempts in range(1, len(preflightRetryDelays) + 2):
+            try:
+                response = asyncio.run(provider.summarizer.preflight())
+            except (RateLimitError, InternalServerError, APIConnectionError) as error:
+                transientErrors.append(type(error).__name__)
+                if attempts > len(preflightRetryDelays):
+                    raise
+                sleep(preflightRetryDelays[attempts - 1])
+            else:
+                break
+        manifest.recordPreflight(response, attempts, transientErrors)
     except BaseException as error:
-        manifest.recordPreflightFailure(type(error).__name__)
+        manifest.recordPreflightFailure(type(error).__name__, attempts, transientErrors)
         if not isinstance(error, Exception):
             raise
         verification = manifest.data['models']['summarization']['provider_pin_verification_status']
         reason = 'несовпадение закреплённого провайдера; ' if verification == 'mismatch' else ''
+        if isinstance(error, (RateLimitError, InternalServerError, APIConnectionError)):
+            reason = f'Временные отказы preflight; попыток: {attempts}; '
         raise RuntimeError(
             f'{reason}Preflight не выполнен: provider={configuration.summarizeProvider}, '
             f'model={configuration.summarizeModel}, ошибка={type(error).__name__}'

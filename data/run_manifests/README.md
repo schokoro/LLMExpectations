@@ -13,10 +13,24 @@ usage: тогда `usage_complete=false`, сумма является тольк
 `summaryFromCache=null` означает, что контекст даты не был получен.
 
 `configured_provider` фиксирует настройку, а не доказательство применения пина.
-`provider_pin_verification` содержит slug из ответа preflight.
+`provider_pin_verification` содержит исходное значение `provider` из ответа preflight:
+отображаемое имя OpenRouter (например, `DeepInfra`), не slug; `null`, если отсутствует.
 `provider_pin_verification_status`: `not_checked` — ответа ещё нет,
-`not_reported` — ответ не содержит provider (slug остаётся null),
-`verified` — slug совпал, `mismatch` — несовпадение, прерывающее запуск.
+`not_reported` — ответ не содержит provider,
+`provider_name_verified` — имя точно равно части пина до `/` без учёта регистра
+и пробелов по краям; `mismatch` — несовпадение, прерывающее запуск.
+Полный slug в ответе или иное различие в имени после такой нормализации — `mismatch`.
+`configured_quantization` — часть пина после `/` (`null`, если её нет).
+`quantization_verification_status`: `not_checked` — до preflight,
+`not_reported` — после успешного preflight: ответ не сообщает квантизацию.
+Она задаётся только маршрутизацией (`provider.order` + `allow_fallbacks: false`
+в `PinnedOpenRouterClient`); манифест её не подтверждает.
+`preflight.attempts` — число попыток; `preflight.transient_errors` — только имена
+типов временных ошибок, никогда не их сообщения. `RateLimitError`,
+`InternalServerError`, `APIConnectionError` (включая таймауты) повторяются:
+не более 3 попыток с паузами 5 и 15 с; остальные ошибки завершают preflight
+при первой попытке. Любая неудачная попытка запроса делает `preflight.usage_complete`
+и `totals.usage_complete` равными `false`, даже если preflight затем успешен.
 Пустой content при успешном preflight допустим: запрос ограничен одним токеном.
 В totals `degraded_dates_count` считает подготовленные даты с непустым
 failed_axes, `unknown_degradation_dates_count` — с failed_axes=null.

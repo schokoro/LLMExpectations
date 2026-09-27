@@ -1786,18 +1786,19 @@ class TestRunManifest(NewsFixtureTestCase):
     def test_preflight_records_served_provider_and_rejects_mismatch(self):
         from openai.types.chat import ChatCompletion
 
-        for index, servedProvider in enumerate((self.configuration.summarizeProvider,
-                                                None, 'other/provider')):
-            responseData = {'id': 'fixture', 'object': 'chat.completion', 'created': 0,
-                            'model': 'fixture', 'choices': []}
-            if servedProvider is not None:
+        fixture = Path(__file__).parent / 'fixtures' / 'openrouter_preflight_response.json'
+        for index, servedProvider in enumerate(('DeepInfra', None, 'deepinfra/fp8')):
+            responseData = json.loads(fixture.read_text(encoding='utf-8'))
+            if servedProvider is None:
+                responseData.pop('provider')
+            else:
                 responseData['provider'] = servedProvider
-            response = ChatCompletion(**responseData)
+            response = ChatCompletion(**responseData, id='fixture', created=0)
             provider = self.createProvider([None])
             provider.configuration = self.configuration
             provider.summarizer = SimpleNamespace(preflight=AsyncMock(return_value=response))
             manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
-            if servedProvider == 'other/provider':
+            if servedProvider == 'deepinfra/fp8':
                 with self.assertRaisesRegex(RuntimeError, 'несовпадение'), manifest:
                     runPreflight(provider, manifest)
                     prepareContexts([self.firstDate], provider, manifest, SilentLogger())
@@ -1810,7 +1811,7 @@ class TestRunManifest(NewsFixtureTestCase):
             written = json.loads(manifest.path.read_text())
             self.assertEqual(servedProvider,
                              written['models']['summarization']['provider_pin_verification'])
-            self.assertEqual(('verified', 'not_reported', 'mismatch')[index],
+            self.assertEqual(('provider_name_verified', 'not_reported', 'mismatch')[index],
                              written['models']['summarization']['provider_pin_verification_status'])
             self.assertEqual('failed' if index == 2 else 'succeeded',
                              written['preflight']['outcome'])
@@ -1828,7 +1829,7 @@ class TestRunManifest(NewsFixtureTestCase):
             provider.summarizer = SimpleNamespace(preflight=AsyncMock(side_effect=error))
             manifest = self.createManifest(self.startedAt + timedelta(seconds=index))
             with self.assertRaises(RuntimeError), manifest:
-                runPreflight(provider, manifest)
+                runPreflight(provider, manifest, sleep=lambda delay: None)
                 prepareContexts([self.firstDate], provider, manifest, SilentLogger())
             provider.prepare.assert_not_called()
             self.assertEqual('aborted', manifest.data['totals']['status'])

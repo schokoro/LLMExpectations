@@ -24,6 +24,14 @@ from SurveyLogic.PromptBuilders.BasePromptBuilder import BasePromptBuilder
 from SurveyLogic.PromptBuilders.CompositePromptBuilder import CompositePromptBuilder
 
 
+def providerNameMatchesPin(servedProvider: object, providerPin: str) -> bool:
+    """Сопоставить имя провайдера с частью пина до разделителя без учёта регистра."""
+    return (
+        isinstance(servedProvider, str)
+        and servedProvider.strip().casefold() == providerPin.split('/', 1)[0].strip().casefold()
+    )
+
+
 def readCodeEnvironment(repository: Path) -> dict:
     """Читать идентификаторы кода, не включая URL установки и секреты окружения."""
 
@@ -149,6 +157,12 @@ class RunManifest:
                     'configured_provider': configuration.summarizeProvider,
                     'provider_pin_verification': None,
                     'provider_pin_verification_status': 'not_checked',
+                    'configured_quantization': (
+                        configuration.summarizeProvider.split('/', 1)[1]
+                        if '/' in configuration.summarizeProvider
+                        else None
+                    ),
+                    'quantization_verification_status': 'not_checked',
                     'api_key_variable': configuration.summarizeApiKeyVariable,
                     'timeout': configuration.summarizeTimeout,
                     'SummarizeConfig': SummarizeConfig(
@@ -235,7 +249,12 @@ class RunManifest:
         }
         self._updateUsage()
 
-    def recordPreflight(self, response: ChatCompletion) -> None:
+    def recordPreflight(
+        self,
+        response: ChatCompletion,
+        attempts: int = 1,
+        transientErrors: list[str] | None = None,
+    ) -> None:
         """Сохранить расход отдельного запроса, включая сообщённую стоимость."""
         providerUsage = response.usage
         usage = Usage(calls=1)
@@ -248,24 +267,37 @@ class RunManifest:
             )
         self.data['preflight'] = {
             'outcome': 'succeeded',
+            'attempts': attempts,
+            'transient_errors': list(transientErrors or []),
             'usage': usage.model_dump(),
             'usage_complete': providerUsage is not None,
             'usage_note': None if providerUsage is not None else 'Провайдер не вернул usage',
             'reported_cost': getattr(providerUsage, 'cost', None),
         }
+        if transientErrors:
+            self.data['preflight']['usage_complete'] = False
+            self.data['preflight']['usage_note'] = (
+                'Были неудачные попытки без usage; расход неизвестен'
+            )
         self._updateUsage()
         summarization = self.data['models']['summarization']
         servedProvider = getattr(response, 'provider', None)
         summarization['provider_pin_verification'] = servedProvider
         if servedProvider is None:
             summarization['provider_pin_verification_status'] = 'not_reported'
-        elif servedProvider == summarization['configured_provider']:
-            summarization['provider_pin_verification_status'] = 'verified'
+        elif providerNameMatchesPin(servedProvider, summarization['configured_provider']):
+            summarization['provider_pin_verification_status'] = 'provider_name_verified'
         else:
             summarization['provider_pin_verification_status'] = 'mismatch'
             raise ValueError('Провайдер preflight отличается от закреплённого')
+        summarization['quantization_verification_status'] = 'not_reported'
 
-    def recordPreflightFailure(self, errorType: str) -> None:
+    def recordPreflightFailure(
+        self,
+        errorType: str,
+        attempts: int = 1,
+        transientErrors: list[str] | None = None,
+    ) -> None:
         """Не сохранять текст ошибки; расход без ответа неизвестен."""
         if self.data['preflight'] is None:
             self.data['preflight'] = {
@@ -274,7 +306,17 @@ class RunManifest:
                 'usage_note': 'Нет ответа с usage; расход неизвестен',
                 'reported_cost': None,
             }
-        self.data['preflight'].update(outcome='failed', error_type=errorType)
+        self.data['preflight'].update(
+            outcome='failed',
+            error_type=errorType,
+            attempts=attempts,
+            transient_errors=list(transientErrors or []),
+        )
+        if transientErrors:
+            self.data['preflight']['usage_complete'] = False
+            self.data['preflight']['usage_note'] = (
+                'Были неудачные попытки без usage; расход неизвестен'
+            )
         self._updateUsage()
 
     def _updateUsage(self) -> None:
