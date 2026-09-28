@@ -31,7 +31,7 @@ from NewsLogic.RunManifest import RunManifest
 
 defaultHorizonDays = 14
 defaultProfilesCount = 100
-defaultModel = 'qwen3.8-27b'
+defaultModel = 'Qwen/Qwen3.6-27B'
 preflightRetryDelays = (5.0, 15.0)
 
 
@@ -77,6 +77,15 @@ def findHorizonConflicts(dates: list[date], projectDbPath: Path, horizonDays: in
             if x.isoformat() in stored and stored[x.isoformat()] != horizonDays]
 
 
+def modelSlug(model: str) -> str:
+    """Имя модели для имени папки: без префикса владельца, точек и дефисов.
+
+    'Qwen/Qwen3.6-27B' -> 'qwen3627b'. Слеш в имени эксперимента превратился бы
+    во вложенную папку результатов.
+    """
+    return model.split('/')[-1].lower().replace('.', '').replace('-', '')
+
+
 def countSavedResponses(resultsFolder: Path, surveyDate: date) -> int:
     return len(list(resultsFolder.glob(f'{surveyDate:%d.%m.%Y}_*.json')))
 
@@ -91,7 +100,7 @@ def parseArguments() -> argparse.Namespace:
     parser.add_argument('--profiles', type=int, default=defaultProfilesCount,
                         help=f'сколько респондентов на дату (по умолчанию {defaultProfilesCount})')
     parser.add_argument('--model', default=defaultModel,
-                        help=f'модель-респондент на BotHub (по умолчанию {defaultModel})')
+                        help=f'модель-респондент на mlcluster (по умолчанию {defaultModel})')
     parser.add_argument('--experiment', default=None,
                         help='имя эксперимента; по умолчанию собирается из имени файла дат и горизонта')
     parser.add_argument('--allow-horizon-overwrite', action='store_true',
@@ -200,7 +209,7 @@ def prepareContexts(
 
 def main(arguments: argparse.Namespace | None = None) -> None:
     from Configuration import configuration
-    from Configuration.configuration import bothub_key
+    from Configuration.configuration import mlcluster_key
     from SurveyLogic.PromptBuilders.profileBuildersHelpers import createNewsPromptBuilder
     from SurveyLogic.Surveyers.AsyncSurveyer import AsyncSurveyer
     from SurveyLogic.surveyHelpers import (
@@ -215,7 +224,7 @@ def main(arguments: argparse.Namespace | None = None) -> None:
         raise SystemExit(f'Горизонт должен быть положительным, получено {arguments.horizon}')
 
     experimentUniqueName = (arguments.experiment
-                            or f'bothub_{arguments.model.replace(".", "").replace("-", "")}'
+                            or f'mlcluster_{modelSlug(arguments.model)}'
                                f'_{arguments.dates.stem}_h{arguments.horizon}')
     profilesFolder = Path('./data/Target profiles')
     resultsFolder = Path('data/SurveyResults/') / experimentUniqueName
@@ -226,7 +235,7 @@ def main(arguments: argparse.Namespace | None = None) -> None:
     )
 
     manifest = RunManifest(experimentUniqueName, newsConfiguration, arguments.model,
-                           configuration.bothubUrl, resultsFolder)
+                           configuration.mlclusterUrl, resultsFolder)
     with manifest:
         manifest.collectInputs(newsConfiguration, profilesFolder, arguments.profiles)
         resultsFolder.mkdir(parents=True, exist_ok=True)
@@ -283,15 +292,15 @@ def main(arguments: argparse.Namespace | None = None) -> None:
         if arguments.contexts_only:
             return
 
-        if not bothub_key.strip():
+        if not mlcluster_key.strip():
             raise SystemExit(
-                'Ключ модели-респондента пуст: Configuration/bothub_key.txt. '
+                'Ключ модели-респондента пуст: Configuration/mlcluster_key.txt. '
                 'Новостные контексты подготовлены и лежат в project.db, повторный запуск '
                 'их не пересчитает; заполните ключ и запустите скрипт снова.'
             )
 
-        surveyer = AsyncSurveyer(modelToUse=arguments.model, key=bothub_key.strip(), logger=logger,
-                                 baseUrl=configuration.bothubUrl)
+        surveyer = AsyncSurveyer(modelToUse=arguments.model, key=mlcluster_key.strip(), logger=logger,
+                                 baseUrl=configuration.mlclusterUrl)
         surveySerializer = SurveySerializer(resultsFolder)
 
         # Шаг 2. Опрос по подготовленным датам.

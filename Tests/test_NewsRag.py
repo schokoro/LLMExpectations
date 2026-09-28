@@ -1626,7 +1626,7 @@ class TestRunManifest(NewsFixtureTestCase):
                 usage=None, choices=[SimpleNamespace(message=SimpleNamespace(content='OK'))],
             ), side_effect=preflightError))
             builder = SimpleNamespace(builders=[], headers=['Новости'])
-            config = SimpleNamespace(bothub_key='unused-test-key', bothubUrl='https://invalid')
+            config = SimpleNamespace(mlcluster_key='unused-test-key', mlclusterUrl='https://invalid')
             factory = SimpleNamespace(createNewsPromptBuilder=Mock(return_value=(builder, builder)))
             helpers = SimpleNamespace(copyPromptTemplatesToFolder=Mock(), createAsyncSurveyRunner=Mock())
             modules = {
