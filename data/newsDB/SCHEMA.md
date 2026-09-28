@@ -190,7 +190,7 @@ CREATE TABLE migrations (
    `axis_block_template`, `axis_system`, `axis_user`, `doc_separator`,
    `doc_template`, `meta_system`, `meta_user`, `name`. Хешируются реальные
    тексты шаблонов и разделителей, а не только имя пакета.
-9. `summarizeProvider` (по умолчанию `deepinfra/fp8`; провайдер закреплён
+9. `summarizeProvider` (по умолчанию `novita/fp8`; провайдер закреплён
    в каждом запросе суммаризации и участвует в `config_hash`).
 10. `summarizeTemperature`.
 11. `topKPerAxis`.

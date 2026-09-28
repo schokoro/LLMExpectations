@@ -1786,6 +1786,7 @@ class TestRunManifest(NewsFixtureTestCase):
     def test_preflight_records_served_provider_and_rejects_mismatch(self):
         from openai.types.chat import ChatCompletion
 
+        self.configuration = replace(self.configuration, summarizeProvider='deepinfra/fp8')
         fixture = Path(__file__).parent / 'fixtures' / 'openrouter_preflight_response.json'
         for index, servedProvider in enumerate(('DeepInfra', None, 'deepinfra/fp8')):
             responseData = json.loads(fixture.read_text(encoding='utf-8'))

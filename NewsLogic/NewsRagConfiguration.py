@@ -97,7 +97,7 @@ class NewsRagConfiguration:
     summarizeModel: str = 'deepseek/deepseek-v4-flash'
     summarizeBaseUrl: str = 'https://openrouter.ai/api/v1'
     # Провайдер закреплён в каждом запросе суммаризации и входит в config_hash.
-    summarizeProvider: str = 'deepinfra/fp8'
+    summarizeProvider: str = 'novita/fp8'
     summarizeApiKeyVariable: str = 'OPENROUTER_API_KEY'
     summarizeTemperature: float = 0.3
     summarizeConcurrency: int = 5

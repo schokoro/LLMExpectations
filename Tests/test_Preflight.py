@@ -29,7 +29,7 @@ def responseData():
 
 @pytest.fixture
 def setupPreflight(tmp_path, responseData):
-    configuration = NewsRagConfiguration()
+    configuration = replace(NewsRagConfiguration(), summarizeProvider='deepinfra/fp8')
     manifest = RunManifest(
         'fixture',
         configuration,
