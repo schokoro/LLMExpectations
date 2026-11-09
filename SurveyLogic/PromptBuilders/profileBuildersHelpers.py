@@ -6,6 +6,7 @@ from SHAPAnalysis.ZeroPlusOneShapCalculator import ZeroPlusOneShapCalculator
 from SHAPAnalysis.shapHelpers import getBitArray
 from SurveyLogic.PromptBuilders.BasePromptBuilder import BasePromptBuilder
 from SurveyLogic.PromptBuilders.CompositePromptBuilder import CompositePromptBuilder
+from SurveyLogic.PromptBuilders.ContextPromptBuilders.NewsProfilePromptBuilder import NewsProfilePromptBuilder
 from SurveyLogic.PromptBuilders.ContextPromptBuilders.NewsPromptBuilder import NewsPromptBuilder
 from SurveyLogic.PromptBuilders.ProfileSepcificPromptBuilders.CommonProfilePromptBuilder import \
     CommonProfilePromptBuilder
@@ -38,7 +39,7 @@ def createNewsPromptBuilder(newsContextProvider: NewsContextProvider) -> (BasePr
     averageBuyingsProvider = ConvertingAverageExpensesProvider(averageBuyingsProvider,
                                                                configuration.rlmsToInflationRegionsPath)
 
-    builders.append(CommonProfilePromptBuilder(prompts.respondentPrompt, mrotProvider, averageBuyingsProvider))
+    builders.append(NewsProfilePromptBuilder(prompts.respondentPrompt, mrotProvider, averageBuyingsProvider))
     builders.append(NewsPromptBuilder(newsContextProvider))
     builders.append(TaskPromptBuilder(prompts.taskPrompt))
 
